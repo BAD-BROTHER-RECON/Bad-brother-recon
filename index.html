@@ -143,6 +143,9 @@
 
   /* ---- Map screen ---- */
   .map-rotate-wrapper{ width:100%; height:52vh; min-height:300px; overflow:hidden; position:relative; border-radius:var(--radius); border:1px solid var(--line); background:var(--panel); }
+  .map-rotate-wrapper.fullscreen{
+    position:fixed; inset:0; width:100vw; height:100vh; z-index:500; border-radius:0; border:none;
+  }
   #map{
     position:absolute; top:50%; left:50%;
     width:145%; height:145%;
@@ -150,6 +153,12 @@
     transition: transform 0.25s linear;
     transform-origin:50% 50%;
   }
+  .map-fullscreen-btn{
+    position:absolute; top:8px; right:8px; z-index:410;
+    width:38px; height:38px; border-radius:50%; display:flex; align-items:center; justify-content:center;
+    background:rgba(28,33,22,0.88); border:1px solid var(--line); color:var(--ink); font-size:17px; padding:0;
+  }
+  .map-rotate-wrapper.fullscreen .map-fullscreen-btn{ top:calc(env(safe-area-inset-top, 0px) + 10px); }
   .status-bar{ display:flex; align-items:center; gap:8px; margin:10px 0; font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--ink-dim); letter-spacing:.05em; text-transform:uppercase; }
   .compass-row{ display:flex; align-items:center; gap:14px; margin-top:12px; }
   .compass-dial{
@@ -198,6 +207,12 @@
     font-family:'JetBrains Mono',monospace; font-size:11px; padding:6px; text-transform:uppercase;
   }
   .zone-legend{ display:flex; flex-wrap:wrap; gap:10px; font-family:'JetBrains Mono',monospace; font-size:10px; color:var(--ink-dim); text-transform:uppercase; letter-spacing:.04em; margin-top:8px; align-items:center; }
+  .warzone-alert{ margin-top:8px; padding:10px 14px; border-radius:var(--radius); border:1px solid; }
+  .warzone-alert.pending{ border-color:var(--amber-dim); background:rgba(201,162,39,0.10); color:var(--amber); }
+  .warzone-alert.active{ border-color:var(--danger); background:rgba(179,64,47,0.14); color:#f2a89a; animation: warzoneflash 1.6s ease-in-out infinite; }
+  .warzone-alert .wz-name{ font-family:'JetBrains Mono',monospace; font-size:11px; text-transform:uppercase; letter-spacing:.05em; opacity:.85; }
+  .warzone-alert .wz-time{ font-size:24px; font-weight:700; margin-top:2px; }
+  @keyframes warzoneflash{ 0%,100%{ opacity:1; } 50%{ opacity:.55; } }
   .zone-legend .dot{ width:8px; height:8px; }
   .leaflet-interactive.zone-objectif{ animation: zonepulse 1.6s ease-in-out infinite; }
   @keyframes zonepulse{ 0%,100%{ fill-opacity:0.22; } 50%{ fill-opacity:0.55; } }
@@ -258,6 +273,7 @@
     testMode: false,
     squadOnly: false,
     compassAngle: 0,
+    mapFullscreen: false,
     rosterSearch: "",
     isOrganizer: false,
     lastCoords: null,   // {lat,lng}
@@ -271,6 +287,7 @@
     scanRAF: null,
     lastEventErr: "",
     zonesSaveWarning: "",
+    revealFromMap: false,
     // Éditeur de bâtiments
     editorMode: null,     // 'draft' (avant création d'événement) | 'live' (pendant la partie)
     editorZones: [],
@@ -283,7 +300,10 @@
     drawPoints: [],
     drawLayer: null,
     editorWatchId: null,
+    editingZoneId: null,   // zone en cours de modification (poignées visibles) dans l'éditeur
     editorMeMarker: null,
+    cachedZones: [],
+    warzoneTickTimer: null,
     _draftZones: []
   };
 
@@ -301,6 +321,7 @@
     { name: "Gris",   color: "#8a8d85" },
     { name: "Orange", color: "#d9702e" }
   ];
+  var STAFF_TEAM = { name: "Staff", color: "#c9a227" };
 
   var ZONE_STATUSES = [
     { key: "intact",   label: "Intact",   color: "#8b9184" },
@@ -591,7 +612,7 @@
   }
 
   function renderCreate(){
-    if(!state._draftTeams) state._draftTeams = [TEAM_COLORS[0]];
+    if(!state._draftTeams) state._draftTeams = [STAFF_TEAM];
     if(!state._draftName) state._draftName = "";
     if(!state._draftCenter) state._draftCenter = null;
     if(!state._draftZones) state._draftZones = [];
@@ -630,7 +651,8 @@
     function drawTeams(){
       var wrap = document.getElementById("teams-list");
       wrap.innerHTML = state._draftTeams.map(function(t, i){
-        return '<span class="team-chip" style="color:'+t.color+'"><span class="dot" style="background:'+t.color+'"></span>'+escapeHtml(t.name)+
+        var icon = t.name === "Staff" ? '<span style="font-size:12px;">👑</span>' : '<span class="dot" style="background:'+t.color+'"></span>';
+        return '<span class="team-chip" style="color:'+t.color+'">'+icon+escapeHtml(t.name)+
           (state._draftTeams.length>1 ? '<button class="remove-chip" data-i="'+i+'">✕</button>' : '')+'</span>';
       }).join("");
       Array.prototype.forEach.call(wrap.querySelectorAll(".remove-chip"), function(btn){
@@ -641,7 +663,8 @@
 
     document.getElementById("btn-add-team").onclick = function(){
       var used = state._draftTeams.map(function(t){return t.name;});
-      var next = TEAM_COLORS.find(function(t){ return used.indexOf(t.name) === -1; });
+      var candidates = [STAFF_TEAM].concat(TEAM_COLORS);
+      var next = candidates.find(function(t){ return used.indexOf(t.name) === -1; });
       if(!next){
         var idx = state._draftTeams.length+1;
         next = { name: "Équipe "+idx, color: "#9b59b6" };
@@ -705,6 +728,7 @@
           state.zonesSaveWarning = "La carte (limite/bâtiments/points) n\u2019a pas pu être enregistrée. Utilise \u00ab Éditer la carte \u00bb sur l\u2019écran carte pour la refaire.";
         }
       }
+      state.revealFromMap = false;
       state.screen = "reveal";
       renderReveal();
     };
@@ -712,22 +736,28 @@
 
   function renderReveal(){
     var cfg = state.event;
+    var fromMap = state.revealFromMap;
     app.innerHTML =
-      '<div class="topbar"><button class="back">‹ Retour</button><div class="eyebrow">Événement créé</div></div>' +
+      '<div class="topbar"><button class="back">‹ Retour</button><div class="eyebrow">'+(fromMap?'Code de la partie':'Événement créé')+'</div></div>' +
       '<div class="panel code-reveal">' +
         '<p class="mono" style="color:var(--ink-dim)">'+escapeHtml(cfg.name)+'</p>' +
         '<div class="big-code">'+cfg.code+'</div>' +
         '<div id="qrcode"></div>' +
-        '<p>Fais scanner ce QR (ou dicte le code) à tes coéquipiers pour qu\u2019ils rejoignent.</p>' +
+        '<p>Fais scanner ce QR (ou dicte le code) à tes coéquipiers pour qu\u2019ils rejoignent — à tout moment de la partie, même en cours de journée.</p>' +
         '<button class="link-btn" id="btn-copy">Copier le code</button>' +
       '</div>' +
-      '<div class="stack" style="margin-top:16px;">' +
-        '<button class="btn btn-primary" id="btn-join-as-organizer">Rejoindre une équipe</button>' +
-        '<button class="btn btn-ghost" id="btn-spectate">Voir la carte sans rejoindre d\u2019équipe</button>' +
-      '</div>' +
+      (fromMap
+        ? '<div class="stack" style="margin-top:16px;"><button class="btn btn-primary" id="btn-back-to-map">Retour à la carte</button></div>'
+        : '<div class="stack" style="margin-top:16px;">' +
+            '<button class="btn btn-primary" id="btn-join-as-organizer">Rejoindre une équipe</button>' +
+            '<button class="btn btn-ghost" id="btn-spectate">Voir la carte sans rejoindre d\u2019équipe</button>' +
+          '</div>') +
       (state.zonesSaveWarning ? '<div class="banner warn">'+escapeHtml(state.zonesSaveWarning)+'</div>' : '');
 
-    document.querySelector(".back").onclick = function(){ state.screen="home"; render(); };
+    document.querySelector(".back").onclick = function(){
+      if(fromMap){ state.screen="map"; } else { state.screen="home"; }
+      render();
+    };
 
     if(LIBS_OK.qrcode){
       new QRCode(document.getElementById("qrcode"), {
@@ -743,8 +773,12 @@
       var b = document.getElementById("btn-copy"); b.textContent = "Copié ✓";
       setTimeout(function(){ b.textContent = "Copier le code"; }, 1500);
     };
-    document.getElementById("btn-join-as-organizer").onclick = function(){ state.screen="team"; render(); };
-    document.getElementById("btn-spectate").onclick = function(){ state.player.team = null; state.player.name = state.player.name || "Organisateur"; state.screen="map"; render(); };
+    if(fromMap){
+      document.getElementById("btn-back-to-map").onclick = function(){ state.screen="map"; render(); };
+    } else {
+      document.getElementById("btn-join-as-organizer").onclick = function(){ state.screen="team"; render(); };
+      document.getElementById("btn-spectate").onclick = function(){ state.player.team = null; state.player.name = state.player.name || "Organisateur"; state.screen="map"; render(); };
+    }
   }
 
   function renderJoin(){
@@ -847,7 +881,8 @@
     function drawChoices(){
       wrap.innerHTML = cfg.teams.map(function(t){
         var sel = state.player.team === t.name;
-        return '<button class="team-chip'+(sel?' selected':'')+'" style="color:'+t.color+'" data-team="'+escapeHtml(t.name)+'"><span class="dot" style="background:'+t.color+'"></span>'+escapeHtml(t.name)+'</button>';
+        var icon = t.name === "Staff" ? '<span style="font-size:12px;">👑</span>' : '<span class="dot" style="background:'+t.color+'"></span>';
+        return '<button class="team-chip'+(sel?' selected':'')+'" style="color:'+t.color+'" data-team="'+escapeHtml(t.name)+'">'+icon+escapeHtml(t.name)+'</button>';
       }).join("");
       Array.prototype.forEach.call(wrap.querySelectorAll("[data-team]"), function(btn){
         btn.onclick = function(){ state.player.team = btn.dataset.team; drawChoices(); };
@@ -870,6 +905,7 @@
     }
 
     function proceedToMap(){
+      if(state.player.team === "Staff"){ state.player._grantStaffOnJoin = true; }
       state.screen = "map";
       render();
     }
@@ -918,7 +954,7 @@
       '<div class="topbar"><button class="back">‹ Retour</button><div class="eyebrow">Bâtiments</div></div>' +
       '<div id="editor-map"></div>' +
       '<p class="mono" id="editor-geo-status" style="font-size:11px;color:var(--ink-dim);margin-top:6px;">Recherche de la position GPS…</p>' +
-      '<p style="margin-top:4px;">Astuce : fais glisser les petits ronds (sommets) ou les points pour ajuster la forme et la position après coup.</p>' +
+      '<p style="margin-top:4px;">Touche un bâtiment, une limite ou un point sur la carte pour faire apparaître ses poignées et le modifier. Touche-le à nouveau pour les cacher.</p>' +
       '<div class="editor-toolbar" id="editor-toolbar"></div>' +
       '<div class="zone-list" id="zone-list"></div>' +
       '<div class="row" style="margin-top:12px;">' +
@@ -1015,7 +1051,9 @@
   function warzoneStyle(z){
     var remaining = (z.deactivateAt||0) - Date.now();
     if(remaining > 0){
-      var label = remaining >= 60000 ? ("Ferme dans " + Math.ceil(remaining/60000) + " min") : ("Ferme dans " + Math.max(1, Math.ceil(remaining/1000)) + " s");
+      var totalSec = Math.ceil(remaining/1000);
+      var mm = Math.floor(totalSec/60), ss = totalSec % 60;
+      var label = "Ferme dans " + mm + ":" + (ss<10?"0":"") + ss;
       return { color:'#d9702e', weight:2, dashArray:'4,4', fillOpacity:0.10, active:false, label: label };
     }
     return { color:'#b3402f', weight:2, dashArray:null, fillOpacity:0.35, active:true, label: "ZONE INTERDITE" };
@@ -1054,8 +1092,14 @@
   // Version éditable réservée à l'éditeur : sommets et points déplaçables au doigt,
   // pour corriger la taille/position d'un tracé après coup (jamais utilisée sur la carte en direct des joueurs).
   function addEditableZoneLayer(map, z){
+    var isEditingThis = state.editingZoneId === z.id;
+
     if(z.kind === "point"){
-      var marker = L.marker(z.latlng, { icon: pointDivIcon(z), draggable: true }).addTo(map).bindTooltip(escapeHtml(z.name));
+      var marker = L.marker(z.latlng, { icon: pointDivIcon(z), draggable: isEditingThis }).addTo(map).bindTooltip(escapeHtml(z.name));
+      marker.on('click', function(){
+        state.editingZoneId = isEditingThis ? null : z.id;
+        drawExistingZones();
+      });
       marker.on('dragend', async function(e){
         var ll = e.target.getLatLng();
         z.latlng = [ll.lat, ll.lng];
@@ -1072,18 +1116,24 @@
     else{ var info = zoneStatusInfo(z.status); style = { color: info.color, weight:2, fillColor: info.color, fillOpacity:0.28 }; }
     var tooltipTxt = isTerrain ? (z.name || "Limite du terrain") : (isWarzone ? (z.name + ' · ' + warzoneStyle(z).label) : z.name);
     var poly = L.polygon(z.points, style).addTo(map).bindTooltip(escapeHtml(tooltipTxt));
+    poly.on('click', function(){
+      state.editingZoneId = isEditingThis ? null : z.id;
+      drawExistingZones();
+    });
     var layers = [poly];
 
-    z.points.forEach(function(pt, idx){
-      var handle = L.marker(pt, { icon: vertexHandleIcon(), draggable: true }).addTo(map);
-      handle.on('drag', function(e){
-        var ll = e.target.getLatLng();
-        z.points[idx] = [ll.lat, ll.lng];
-        poly.setLatLngs(z.points);
+    if(isEditingThis){
+      z.points.forEach(function(pt, idx){
+        var handle = L.marker(pt, { icon: vertexHandleIcon(), draggable: true }).addTo(map);
+        handle.on('drag', function(e){
+          var ll = e.target.getLatLng();
+          z.points[idx] = [ll.lat, ll.lng];
+          poly.setLatLngs(z.points);
+        });
+        handle.on('dragend', async function(){ await persistEditorZones(); });
+        layers.push(handle);
       });
-      handle.on('dragend', async function(){ await persistEditorZones(); });
-      layers.push(handle);
-    });
+    }
 
     return layers;
   }
@@ -1148,10 +1198,10 @@
         '<div class="row" style="margin-top:6px;">' +
           '<button class="btn btn-sm btn-ghost" id="btn-start-warzone">☠ Zone de guerre</button>' +
         '</div>';
-      document.getElementById("btn-start-terrain").onclick = function(){ state.drawing = true; state.drawKind = "terrain"; state.drawPoints = []; drawToolbar(); };
-      document.getElementById("btn-start-draw").onclick = function(){ state.drawing = true; state.drawKind = "building"; state.drawPoints = []; drawToolbar(); };
-      document.getElementById("btn-start-point").onclick = function(){ state.placingPoint = true; drawToolbar(); };
-      document.getElementById("btn-start-warzone").onclick = function(){ state.drawing = true; state.drawKind = "guerre"; state.drawPoints = []; drawToolbar(); };
+      document.getElementById("btn-start-terrain").onclick = function(){ state.editingZoneId = null; state.drawing = true; state.drawKind = "terrain"; state.drawPoints = []; drawExistingZones(); drawToolbar(); };
+      document.getElementById("btn-start-draw").onclick = function(){ state.editingZoneId = null; state.drawing = true; state.drawKind = "building"; state.drawPoints = []; drawExistingZones(); drawToolbar(); };
+      document.getElementById("btn-start-point").onclick = function(){ state.editingZoneId = null; state.placingPoint = true; drawExistingZones(); drawToolbar(); };
+      document.getElementById("btn-start-warzone").onclick = function(){ state.editingZoneId = null; state.drawing = true; state.drawKind = "guerre"; state.drawPoints = []; drawExistingZones(); drawToolbar(); };
       return;
     }
 
@@ -1342,6 +1392,7 @@
     Array.prototype.forEach.call(wrap.querySelectorAll(".zone-del"), function(btn){
       btn.onclick = async function(){
         state.editorZones = state.editorZones.filter(function(z){ return z.id !== btn.dataset.id; });
+        if(state.editingZoneId === btn.dataset.id) state.editingZoneId = null;
         drawExistingZones(); drawZoneList();
         await persistEditorZones();
       };
@@ -1419,6 +1470,7 @@
 
   function teardownEditorMap(){
     state.drawing = false; state.drawPoints = []; state.drawLayer = null; state.drawKind = null; state.placingPoint = false;
+    state.editingZoneId = null;
     stopEditorGeoWatch();
     if(state.editorMap){ state.editorMap.remove(); state.editorMap = null; }
     state.editorLayers = {};
@@ -1478,7 +1530,7 @@
       var players = await loadPlayers(cfg.code);
       var vis = await loadVisibility(cfg.code);
 
-      teamsEl.innerHTML = cfg.teams.map(function(t){
+      teamsEl.innerHTML = cfg.teams.filter(function(t){ return t.name !== "Staff"; }).map(function(t){
         var on = vis.revealedTeams.indexOf(t.name) !== -1;
         return '<div class="test-toggle"><span style="color:'+t.color+'">● '+escapeHtml(t.name)+'</span>' +
           '<input type="checkbox" class="team-vis-toggle" data-team="'+escapeHtml(t.name)+'" '+(on?'checked':'')+' /></div>';
@@ -1561,8 +1613,9 @@
     var cfg = state.event;
     app.innerHTML =
       '<div class="topbar"><button class="back">‹ Quitter</button><div class="eyebrow">'+escapeHtml(cfg.name)+' · '+cfg.code+'</div></div>' +
-      '<div class="map-rotate-wrapper"><div id="map"></div></div>' +
+      '<div class="map-rotate-wrapper" id="map-wrapper"><div id="map"></div><button class="map-fullscreen-btn" id="btn-fullscreen-map" title="Plein écran">⛶</button></div>' +
       '<div class="status-bar"><span class="status-dot" id="status-dot"></span><span id="status-text">Initialisation…</span></div>' +
+      '<div id="warzone-banner"></div>' +
       '<div class="zone-legend">' +
         ZONE_STATUSES.map(function(s){ return '<span><span class="dot" style="background:'+s.color+'"></span> '+s.label+'</span>'; }).join("") +
       '</div>' +
@@ -1593,6 +1646,23 @@
     document.getElementById("btn-compass-reset").onclick = function(){
       state.compassAngle = 0;
       applyCompassRotation();
+    };
+    document.getElementById("btn-fullscreen-map").onclick = function(){
+      state.mapFullscreen = !state.mapFullscreen;
+      var wrapper = document.getElementById("map-wrapper");
+      var btn = document.getElementById("btn-fullscreen-map");
+      if(state.mapFullscreen){
+        wrapper.classList.add("fullscreen");
+        btn.textContent = "✕";
+        btn.title = "Quitter le plein écran";
+      } else {
+        wrapper.classList.remove("fullscreen");
+        btn.textContent = "⛶";
+        btn.title = "Plein écran";
+      }
+      // La rotation en cours (state.compassAngle) n'est jamais touchée ici — elle reste
+      // exactement comme le joueur (ou le staff) l'avait réglée avant de basculer.
+      setTimeout(function(){ if(state.map) state.map.invalidateSize(); }, 60);
     };
     var squadToggle = document.getElementById("squad-only-toggle");
     if(squadToggle) squadToggle.onchange = function(e){ state.squadOnly = e.target.checked; refreshPlayers(); };
@@ -1635,6 +1705,17 @@
     state.pollTimer = setInterval(function(){ refreshPlayers(); refreshZones(); }, 4000);
     refreshPlayers();
     refreshZones();
+    startWarzoneTicker();
+  }
+
+  // Fait défiler le compte à rebours des zones de guerre seconde par seconde, à partir des
+  // données déjà en cache — pas besoin d'interroger le réseau plus souvent pour ça.
+  function startWarzoneTicker(){
+    if(state.warzoneTickTimer) return;
+    state.warzoneTickTimer = setInterval(function(){ updateWarzoneBanner(state.cachedZones); }, 1000);
+  }
+  function stopWarzoneTicker(){
+    if(state.warzoneTickTimer){ clearInterval(state.warzoneTickTimer); state.warzoneTickTimer = null; }
   }
 
   // ---------- Rotation manuelle de la carte (cadran à glisser, façon Google Maps) ----------
@@ -1722,7 +1803,7 @@
   async function writePositionNow(){
     if(!state.lastCoords || !state.event) return;
     if(!state.player.name) return; // organisateur en mode "spectateur" sans équipe: on peut quand même afficher sa position s'il a un nom
-    await upsertPlayer(state.event.code, state.playerId, {
+    var payload = {
       name: state.player.name,
       team: state.player.team,
       squad: state.player.squad || "",
@@ -1730,7 +1811,14 @@
       staffHidden: !!state.player.staffHidden,
       lat: state.lastCoords.lat,
       lng: state.lastCoords.lng
-    });
+    };
+    // Rejoindre via l'équipe Staff accorde le rôle une seule fois, à la création du point —
+    // ensuite l'organisateur garde la main entière via Rôles & visibilité (pas réimposé à chaque envoi).
+    if(state.player._grantStaffOnJoin){
+      payload.role = "staff";
+      state.player._grantStaffOnJoin = false;
+    }
+    await upsertPlayer(state.event.code, state.playerId, payload);
   }
 
   function updateAdminUI(){
@@ -1741,7 +1829,8 @@
     el.dataset.bound = "1";
     el.innerHTML =
       '<button class="btn btn-ghost btn-sm" id="btn-edit-buildings-live">Éditer la carte</button>' +
-      '<button class="btn btn-ghost btn-sm" id="btn-roles-live">Rôles & visibilité</button>';
+      '<button class="btn btn-ghost btn-sm" id="btn-roles-live">Rôles & visibilité</button>' +
+      '<button class="btn btn-ghost btn-sm" id="btn-code-live">Code / QR</button>';
     document.getElementById("btn-edit-buildings-live").onclick = async function(){
       var code = state.event.code;
       state.editorMode = "live";
@@ -1756,6 +1845,12 @@
       state.screen = "roles";
       render();
     };
+    document.getElementById("btn-code-live").onclick = function(){
+      teardownMap();
+      state.revealFromMap = true;
+      state.screen = "reveal";
+      render();
+    };
   }
 
   function updateStaffUI(amStaff){
@@ -1765,10 +1860,29 @@
     if(el.dataset.bound === "1") return;
     el.dataset.bound = "1";
     el.innerHTML = '<div class="test-toggle"><span class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">Visible des autres joueurs (staff)</span>' +
-      '<input type="checkbox" id="staff-visible-toggle" '+(state.player.staffHidden?'':'checked')+' /></div>';
+      '<input type="checkbox" id="staff-visible-toggle" '+(state.player.staffHidden?'':'checked')+' /></div>' +
+      '<div class="row" style="margin-top:8px;">' +
+        '<button class="btn btn-ghost btn-sm" id="btn-edit-buildings-staff">Éditer la carte</button>' +
+        '<button class="btn btn-ghost btn-sm" id="btn-code-staff">Code / QR</button>' +
+      '</div>';
     document.getElementById("staff-visible-toggle").onchange = async function(e){
       state.player.staffHidden = !e.target.checked;
       if(state.event) await upsertPlayer(state.event.code, state.playerId, { staffHidden: state.player.staffHidden });
+    };
+    document.getElementById("btn-edit-buildings-staff").onclick = async function(){
+      var code = state.event.code;
+      state.editorMode = "live";
+      state.editorZones = await loadZones(code);
+      state.editorCenter = state.event.center;
+      teardownMap();
+      state.screen = "editor";
+      render();
+    };
+    document.getElementById("btn-code-staff").onclick = function(){
+      teardownMap();
+      state.revealFromMap = true;
+      state.screen = "reveal";
+      render();
     };
   }
 
@@ -1851,7 +1965,23 @@
   async function refreshZones(){
     if(!state.event) return;
     var zones = await loadZones(state.event.code);
+    state.cachedZones = zones;
     updateZonePolygons(zones);
+    updateWarzoneBanner(zones);
+  }
+
+  function updateWarzoneBanner(zones){
+    var el = document.getElementById("warzone-banner");
+    if(!el) return;
+    var warzones = (zones||[]).filter(function(z){ return z.kind === "guerre" && isValidZone(z); });
+    if(!warzones.length){ el.innerHTML = ""; return; }
+    el.innerHTML = warzones.map(function(z){
+      var wz = warzoneStyle(z);
+      return '<div class="warzone-alert '+(wz.active?'active':'pending')+'">' +
+        '<div class="wz-name">'+(wz.active?'☠ ':'⚠ ')+escapeHtml(z.name)+'</div>' +
+        '<div class="wz-time">'+wz.label+'</div>' +
+      '</div>';
+    }).join("");
   }
 
   function isValidZone(z){
@@ -1973,7 +2103,9 @@
     if(state.watchId !== null && navigator.geolocation){ navigator.geolocation.clearWatch(state.watchId); state.watchId = null; }
     if(state.writeTimer){ clearInterval(state.writeTimer); state.writeTimer = null; }
     if(state.pollTimer){ clearInterval(state.pollTimer); state.pollTimer = null; }
+    stopWarzoneTicker();
     state.compassAngle = 0;
+    state.mapFullscreen = false;
     if(state.map){ state.map.remove(); state.map = null; }
     state.markers = {};
     state.zonesLayers = {};
@@ -1987,6 +2119,7 @@
     if(state.watchId !== null && navigator.geolocation){ navigator.geolocation.clearWatch(state.watchId); state.watchId = null; }
     if(state.writeTimer){ clearInterval(state.writeTimer); state.writeTimer = null; }
     if(state.pollTimer){ clearInterval(state.pollTimer); state.pollTimer = null; }
+    stopWarzoneTicker();
     stopEditorGeoWatch();
   });
 
