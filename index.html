@@ -151,6 +151,14 @@
     transform-origin:50% 50%;
   }
   .status-bar{ display:flex; align-items:center; gap:8px; margin:10px 0; font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--ink-dim); letter-spacing:.05em; text-transform:uppercase; }
+  .compass-row{ display:flex; align-items:center; gap:14px; margin-top:12px; }
+  .compass-dial{
+    width:60px; height:60px; border-radius:50%; background:var(--panel-2); border:2px solid var(--line);
+    position:relative; flex:none; touch-action:none; cursor:grab;
+  }
+  .compass-dial-face{ position:absolute; inset:0; transform: rotate(var(--compass-angle)); }
+  .compass-dial-n{ position:absolute; top:3px; left:50%; transform:translateX(-50%); color:var(--amber); font-family:'JetBrains Mono',monospace; font-weight:700; font-size:11px; }
+  .compass-dial::after{ content:""; position:absolute; top:50%; left:50%; width:6px; height:6px; margin:-3px; border-radius:50%; background:var(--ink-dim); }
   .status-dot{ width:8px; height:8px; border-radius:50%; background:var(--green); flex:none; }
   .status-dot.off{ background:var(--danger); }
   .roster{ display:flex; flex-direction:column; gap:6px; margin-top:10px; }
@@ -249,9 +257,7 @@
     player: { name: "", team: null, squad: "" },
     testMode: false,
     squadOnly: false,
-    compassMode: false,
     compassAngle: 0,
-    compassHandler: null,
     rosterSearch: "",
     isOrganizer: false,
     lastCoords: null,   // {lat,lng}
@@ -467,6 +473,12 @@
     var players = await loadPlayers(code);
     if(!players[playerId]) return false;
     players[playerId].role = role;
+    return storageSet(eventPlayersKey(code), JSON.stringify(players));
+  }
+  async function setPlayerInfected(code, playerId, infected){
+    var players = await loadPlayers(code);
+    if(!players[playerId]) return false;
+    players[playerId].infected = infected;
     return storageSet(eventPlayersKey(code), JSON.stringify(players));
   }
 
@@ -999,6 +1011,16 @@
     }
   }
 
+  // Calcule l'apparence de la zone de guerre selon le temps restant avant fermeture.
+  function warzoneStyle(z){
+    var remaining = (z.deactivateAt||0) - Date.now();
+    if(remaining > 0){
+      var label = remaining >= 60000 ? ("Ferme dans " + Math.ceil(remaining/60000) + " min") : ("Ferme dans " + Math.max(1, Math.ceil(remaining/1000)) + " s");
+      return { color:'#d9702e', weight:2, dashArray:'4,4', fillOpacity:0.10, active:false, label: label };
+    }
+    return { color:'#b3402f', weight:2, dashArray:null, fillOpacity:0.35, active:true, label: "ZONE INTERDITE" };
+  }
+
   function addZoneLayer(map, z){
     var layer;
     if(z.kind === "point"){
@@ -1006,6 +1028,12 @@
     } else if(z.kind === "terrain"){
       layer = L.polygon(z.points, { color:'#c9a227', weight:2, dashArray:'6,6', fillOpacity:0.04 })
         .addTo(map).bindTooltip(escapeHtml(z.name || "Limite du terrain"));
+    } else if(z.kind === "guerre"){
+      var wz = warzoneStyle(z);
+      layer = L.polygon(z.points, {
+        color: wz.color, weight: wz.weight, fillColor: wz.color, fillOpacity: wz.fillOpacity,
+        dashArray: wz.dashArray, className: wz.active ? 'zone-objectif' : ''
+      }).addTo(map).bindTooltip(escapeHtml(z.name) + ' · ' + wz.label);
     } else {
       var info = zoneStatusInfo(z.status);
       layer = L.polygon(z.points, {
@@ -1037,10 +1065,13 @@
     }
 
     var isTerrain = z.kind === "terrain";
-    var style = isTerrain
-      ? { color:'#c9a227', weight:2, dashArray:'6,6', fillOpacity:0.04 }
-      : (function(){ var info = zoneStatusInfo(z.status); return { color: info.color, weight:2, fillColor: info.color, fillOpacity:0.28 }; })();
-    var poly = L.polygon(z.points, style).addTo(map).bindTooltip(escapeHtml(z.name || (isTerrain ? "Limite du terrain" : "")));
+    var isWarzone = z.kind === "guerre";
+    var style;
+    if(isTerrain){ style = { color:'#c9a227', weight:2, dashArray:'6,6', fillOpacity:0.04 }; }
+    else if(isWarzone){ var wz = warzoneStyle(z); style = { color: wz.color, weight: wz.weight, fillColor: wz.color, fillOpacity: wz.fillOpacity, dashArray: wz.dashArray }; }
+    else{ var info = zoneStatusInfo(z.status); style = { color: info.color, weight:2, fillColor: info.color, fillOpacity:0.28 }; }
+    var tooltipTxt = isTerrain ? (z.name || "Limite du terrain") : (isWarzone ? (z.name + ' · ' + warzoneStyle(z).label) : z.name);
+    var poly = L.polygon(z.points, style).addTo(map).bindTooltip(escapeHtml(tooltipTxt));
     var layers = [poly];
 
     z.points.forEach(function(pt, idx){
@@ -1058,8 +1089,9 @@
   }
 
   function orderedZones(zones){
-    // la limite de terrain d'abord (dessous), puis les bâtiments, puis les points (dessus)
+    // la limite de terrain d'abord (dessous), puis les zones de guerre, puis les bâtiments, puis les points (dessus)
     return zones.filter(function(z){ return z.kind === "terrain"; })
+      .concat(zones.filter(function(z){ return z.kind === "guerre"; }))
       .concat(zones.filter(function(z){ return z.kind === "building" || !z.kind; }))
       .concat(zones.filter(function(z){ return z.kind === "point"; }));
   }
@@ -1112,14 +1144,18 @@
         '<div class="row" style="margin-top:6px;">' +
           '<button class="btn btn-sm btn-ghost" id="btn-start-draw">+ Bâtiment</button>' +
           '<button class="btn btn-sm btn-ghost" id="btn-start-point">+ Point</button>' +
+        '</div>' +
+        '<div class="row" style="margin-top:6px;">' +
+          '<button class="btn btn-sm btn-ghost" id="btn-start-warzone">☠ Zone de guerre</button>' +
         '</div>';
       document.getElementById("btn-start-terrain").onclick = function(){ state.drawing = true; state.drawKind = "terrain"; state.drawPoints = []; drawToolbar(); };
       document.getElementById("btn-start-draw").onclick = function(){ state.drawing = true; state.drawKind = "building"; state.drawPoints = []; drawToolbar(); };
       document.getElementById("btn-start-point").onclick = function(){ state.placingPoint = true; drawToolbar(); };
+      document.getElementById("btn-start-warzone").onclick = function(){ state.drawing = true; state.drawKind = "guerre"; state.drawPoints = []; drawToolbar(); };
       return;
     }
 
-    var label = state.drawKind === "terrain" ? "coin de la limite du terrain" : "coin du bâtiment";
+    var label = state.drawKind === "terrain" ? "coin de la limite du terrain" : (state.drawKind === "guerre" ? "coin de la zone de guerre" : "coin du bâtiment");
     el.innerHTML =
       '<span class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">Points placés : '+state.drawPoints.length+' (min. 3)</span>' +
       '<div class="row" style="margin-top:6px;">' +
@@ -1148,9 +1184,11 @@
   function finishDrawing(){
     if(state.drawPoints.length < 3) return;
     var isTerrain = state.drawKind === "terrain";
+    var isWarzone = state.drawKind === "guerre";
     var el = document.getElementById("editor-toolbar");
     el.innerHTML =
-      (isTerrain ? '' : '<div class="field" style="margin-top:0;"><label>Nom du bâtiment</label><input type="text" id="zone-name" placeholder="Ex. Hangar Nord" /></div>') +
+      (isTerrain ? '' : '<div class="field" style="margin-top:0;"><label>Nom '+(isWarzone?'de la zone':'du bâtiment')+' (optionnel)</label><input type="text" id="zone-name" placeholder="'+(isWarzone?'Ex. Secteur Nord':'Ex. Hangar Nord')+'" /></div>') +
+      (isWarzone ? '<div class="field"><label>Devient interdite dans (minutes)</label><input type="number" id="zone-minutes" value="5" min="1" style="text-align:left;" /></div>' : '') +
       '<div class="row" style="margin-top:8px;">' +
         '<button class="btn btn-sm btn-primary" id="btn-confirm-zone">'+(isTerrain ? 'Valider la limite' : 'Ajouter')+'</button>' +
         '<button class="btn btn-sm btn-ghost" id="btn-cancel-draw2">Annuler</button>' +
@@ -1166,6 +1204,11 @@
       if(isTerrain){
         state.editorZones = state.editorZones.filter(function(z){ return z.kind !== "terrain"; });
         state.editorZones.unshift({ id: genId("t"), kind: "terrain", name: "Limite du terrain", points: state.drawPoints.slice() });
+      } else if(isWarzone){
+        var name2 = nameInput && nameInput.value.trim() ? nameInput.value.trim() : "Zone de guerre";
+        var minutesInput = document.getElementById("zone-minutes");
+        var minutes = Math.max(1, parseInt(minutesInput && minutesInput.value, 10) || 5);
+        state.editorZones.push({ id: genId("w"), kind: "guerre", name: name2, points: state.drawPoints.slice(), deactivateAt: Date.now() + minutes*60000 });
       } else {
         var name = nameInput && nameInput.value.trim() ? nameInput.value.trim() : "Bâtiment";
         state.editorZones.push({ id: genId("z"), kind: "building", name: name, points: state.drawPoints.slice(), status: "intact" });
@@ -1258,6 +1301,15 @@
           '<button class="remove-chip zone-del" data-id="'+z.id+'">✕</button>' +
         '</div>';
       }
+      if(z.kind === "guerre"){
+        var wz = warzoneStyle(z);
+        return '<div class="zone-row">' +
+          '<span class="dot" style="background:'+wz.color+'"></span>' +
+          '<span class="name">'+escapeHtml(z.name)+' <span class="mono" style="font-size:10px;color:var(--ink-dim);">· '+wz.label+'</span></span>' +
+          (wz.active ? '' : '<button class="btn btn-sm btn-ghost warzone-now" data-id="'+z.id+'" style="padding:6px 10px;">Fermer maintenant</button>') +
+          '<button class="remove-chip zone-del" data-id="'+z.id+'">✕</button>' +
+        '</div>';
+      }
       var info = zoneStatusInfo(z.status);
       return '<div class="zone-row">' +
         '<span class="dot" style="background:'+info.color+'"></span>' +
@@ -1279,6 +1331,12 @@
       sel.onchange = async function(){
         var z = state.editorZones.find(function(z){ return z.id === sel.dataset.id; });
         if(z){ z.status = sel.value; drawExistingZones(); drawZoneList(); await persistEditorZones(); }
+      };
+    });
+    Array.prototype.forEach.call(wrap.querySelectorAll(".warzone-now"), function(btn){
+      btn.onclick = async function(){
+        var z = state.editorZones.find(function(z){ return z.id === btn.dataset.id; });
+        if(z){ z.deactivateAt = Date.now(); drawExistingZones(); drawZoneList(); await persistEditorZones(); }
       };
     });
     Array.prototype.forEach.call(wrap.querySelectorAll(".zone-del"), function(btn){
@@ -1348,7 +1406,7 @@
     document.getElementById("btn-confirm-save-map").onclick = async function(){
       var name = input.value.trim();
       if(!name) return;
-      var tpl = { id: genId("map"), name: name, zones: state.editorZones.map(function(z){
+      var tpl = { id: genId("map"), name: name, zones: state.editorZones.filter(function(z){ return z.kind !== "guerre"; }).map(function(z){
         if(z.kind === "point"){ return { kind:"point", name:z.name, latlng:z.latlng, icon:z.icon, color:z.color }; }
         return { kind: z.kind || "building", name: z.name, points: z.points };
       }) };
@@ -1389,6 +1447,11 @@
         '<label class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">Administrateur</label>' +
         '<p style="margin-top:4px;">Transfère tous tes droits (édition de carte, rôles) à un membre du staff. Tu deviendras toi-même staff.</p>' +
         '<div id="admin-transfer" style="margin-top:8px;"></div>' +
+      '</div>' +
+      '<div class="panel" style="margin-top:14px;">' +
+        '<label class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">🧟 Mode zombie</label>' +
+        '<p style="margin-top:4px;">Désigne un ou plusieurs joueurs comme zombies — leur point affiche 🧟 au lieu de leurs initiales.</p>' +
+        '<div id="zombie-list" style="margin-top:8px;"></div>' +
       '</div>';
 
     document.querySelector(".back").onclick = function(){ state.screen = "map"; render(); };
@@ -1406,9 +1469,11 @@
       var teamsEl = document.getElementById("teams-visibility");
       var staffEl = document.getElementById("staff-list");
       var transferEl = document.getElementById("admin-transfer");
+      var zombieEl = document.getElementById("zombie-list");
       teamsEl.innerHTML = '<p class="mono" style="font-size:11px;color:var(--ink-dim);">Chargement…</p>';
       staffEl.innerHTML = "";
       transferEl.innerHTML = "";
+      zombieEl.innerHTML = "";
 
       var players = await loadPlayers(cfg.code);
       var vis = await loadVisibility(cfg.code);
@@ -1477,6 +1542,18 @@
           };
         });
       }
+
+      zombieEl.innerHTML = pids.map(function(pid){
+        var p = players[pid];
+        return '<div class="test-toggle"><span>'+escapeHtml(p.name||"?")+
+          '<span class="mono" style="font-size:10px;color:var(--ink-dim);"> · '+escapeHtml(p.team||"—")+'</span></span>' +
+          '<input type="checkbox" class="zombie-toggle" data-pid="'+pid+'" '+(p.infected?'checked':'')+' /></div>';
+      }).join("");
+      Array.prototype.forEach.call(zombieEl.querySelectorAll(".zombie-toggle"), function(cb){
+        cb.onchange = async function(){
+          await setPlayerInfected(cfg.code, cb.dataset.pid, cb.checked);
+        };
+      });
     }
   }
 
@@ -1489,9 +1566,12 @@
       '<div class="zone-legend">' +
         ZONE_STATUSES.map(function(s){ return '<span><span class="dot" style="background:'+s.color+'"></span> '+s.label+'</span>'; }).join("") +
       '</div>' +
-      '<div class="test-toggle"><span class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">Rotation libre (boussole)</span>' +
-        '<input type="checkbox" id="compass-toggle" '+(state.compassMode?'checked':'')+' /></div>' +
-      '<p id="compass-status" style="font-size:11px;color:var(--ink-dim);margin-top:4px;"></p>' +
+      '<div class="compass-row">' +
+        '<div class="compass-dial" id="compass-dial"><div class="compass-dial-face" id="compass-dial-face"><span class="compass-dial-n">N</span></div></div>' +
+        '<div><p class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;margin:0;">Rotation manuelle</p>' +
+        '<p style="margin:2px 0 0;">Fais glisser le cadran pour orienter la carte.</p>' +
+        '<button class="btn btn-sm btn-ghost" id="btn-compass-reset" style="margin-top:6px;">↑ Nord en haut</button></div>' +
+      '</div>' +
       '<div class="test-toggle"><span class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">Mode test (clic sur la carte = ta position)</span>' +
         '<input type="checkbox" id="test-mode" '+(state.testMode?'checked':'')+' /></div>' +
       (state.player.squad ? '<div class="test-toggle"><span class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">Mon escouade seulement ('+escapeHtml(state.player.squad)+')</span>' +
@@ -1509,24 +1589,10 @@
 
     document.querySelector(".back").onclick = function(){ teardownMap(); state.screen="home"; render(); };
     document.getElementById("test-mode").onchange = function(e){ state.testMode = e.target.checked; applyGeoMode(); };
-    document.getElementById("compass-toggle").onchange = async function(e){
-      var cb = e.target;
-      var status = document.getElementById("compass-status");
-      if(cb.checked){
-        var ok = await enableCompassMode();
-        if(!ok){
-          cb.checked = false;
-          state.compassMode = false;
-          if(status) status.textContent = "Boussole indisponible sur cet appareil/navigateur — reste en mode Nord en haut.";
-          return;
-        }
-        state.compassMode = true;
-        if(status) status.textContent = "Oriente ton téléphone à plat pour une meilleure précision.";
-      } else {
-        disableCompassMode();
-        state.compassMode = false;
-        if(status) status.textContent = "";
-      }
+    setupCompassDial();
+    document.getElementById("btn-compass-reset").onclick = function(){
+      state.compassAngle = 0;
+      applyCompassRotation();
     };
     var squadToggle = document.getElementById("squad-only-toggle");
     if(squadToggle) squadToggle.onchange = function(e){ state.squadOnly = e.target.checked; refreshPlayers(); };
@@ -1571,50 +1637,42 @@
     refreshZones();
   }
 
-  // ---------- Rotation boussole de la carte ----------
-  // Le support du capteur boussole varie selon téléphone/navigateur — c'est une option,
-  // le mode "Nord en haut" par défaut n'est jamais affecté si ça ne fonctionne pas bien
-  // sur un appareil donné.
+  // ---------- Rotation manuelle de la carte (cadran à glisser, façon Google Maps) ----------
+  // Le capteur boussole des téléphones s'est révélé trop peu fiable (saccades, valeurs
+  // erratiques) — on laisse maintenant le joueur orienter la carte lui-même au doigt,
+  // ce qui est stable partout, sans dépendre du matériel.
   function applyCompassRotation(){
     var mapEl = document.getElementById("map");
     if(mapEl) mapEl.style.transform = "rotate(" + (-state.compassAngle) + "deg)";
     document.documentElement.style.setProperty("--compass-angle", state.compassAngle + "deg");
   }
 
-  function handleDeviceOrientation(e){
-    var heading = null;
-    if(typeof e.webkitCompassHeading === "number" && !isNaN(e.webkitCompassHeading)){
-      heading = e.webkitCompassHeading; // iOS Safari : cap boussole direct
-    } else if(typeof e.alpha === "number" && !isNaN(e.alpha)){
-      heading = 360 - e.alpha; // Android : alpha tourne dans le sens inverse du cap
-    }
-    if(heading === null) return;
-    state.compassAngle = heading;
-    applyCompassRotation();
-  }
+  function setupCompassDial(){
+    var dial = document.getElementById("compass-dial");
+    if(!dial) return;
+    var dragging = false;
 
-  async function enableCompassMode(){
-    if(typeof DeviceOrientationEvent !== "undefined" && typeof DeviceOrientationEvent.requestPermission === "function"){
-      try{
-        var res = await DeviceOrientationEvent.requestPermission();
-        if(res !== "granted") return false;
-      }catch(e){ return false; }
+    function angleFromPoint(clientX, clientY){
+      var rect = dial.getBoundingClientRect();
+      var cx = rect.left + rect.width/2, cy = rect.top + rect.height/2;
+      var dx = clientX - cx, dy = clientY - cy;
+      var deg = Math.atan2(dy, dx) * 180 / Math.PI + 90;
+      return (deg + 360) % 360;
     }
-    if(typeof DeviceOrientationEvent === "undefined") return false;
-    state.compassHandler = handleDeviceOrientation;
-    window.addEventListener("deviceorientationabsolute", state.compassHandler, true);
-    window.addEventListener("deviceorientation", state.compassHandler, true);
-    return true;
-  }
 
-  function disableCompassMode(){
-    if(state.compassHandler){
-      window.removeEventListener("deviceorientationabsolute", state.compassHandler, true);
-      window.removeEventListener("deviceorientation", state.compassHandler, true);
-      state.compassHandler = null;
-    }
-    state.compassAngle = 0;
-    applyCompassRotation();
+    dial.addEventListener("pointerdown", function(e){
+      dragging = true;
+      try{ dial.setPointerCapture(e.pointerId); }catch(err){}
+      state.compassAngle = angleFromPoint(e.clientX, e.clientY);
+      applyCompassRotation();
+    });
+    dial.addEventListener("pointermove", function(e){
+      if(!dragging) return;
+      state.compassAngle = angleFromPoint(e.clientX, e.clientY);
+      applyCompassRotation();
+    });
+    dial.addEventListener("pointerup", function(){ dragging = false; });
+    dial.addEventListener("pointercancel", function(){ dragging = false; });
   }
 
   // Bascule proprement entre géolocalisation réelle et mode test : l'une des
@@ -1813,6 +1871,12 @@
           if(z.kind === "building" || !z.kind){
             var info = zoneStatusInfo(z.status);
             state.zonesLayers[z.id].setStyle({ color: info.color, fillColor: info.color });
+          } else if(z.kind === "guerre"){
+            var wz = warzoneStyle(z);
+            var layer = state.zonesLayers[z.id];
+            layer.setStyle({ color: wz.color, fillColor: wz.color, fillOpacity: wz.fillOpacity, dashArray: wz.dashArray });
+            if(layer._path) layer._path.classList.toggle('zone-objectif', !!wz.active);
+            layer.setTooltipContent(escapeHtml(z.name) + ' · ' + wz.label);
           }
           return;
         }
@@ -1834,7 +1898,8 @@
       var color = teamColor(state.event, p.team) || "#9b9b9b";
       var initials = (p.name||"?").trim().slice(0,2).toUpperCase();
       var badgeGlyph = initials, badgeSize = "11px";
-      if(p.isAdmin){ badgeGlyph = "👑"; badgeSize = "13px"; }
+      if(p.infected){ badgeGlyph = "🧟"; badgeSize = "13px"; color = "#3e6b2f"; }
+      else if(p.isAdmin){ badgeGlyph = "👑"; badgeSize = "13px"; }
       else if(p.role === "staff"){ badgeGlyph = "🛡"; badgeSize = "13px"; }
       var html = '<div class="marker-badge'+(isMe?' me':'')+(p.sos?' sos':'')+'" style="background:'+color+';font-size:'+badgeSize+';">'+escapeHtml(badgeGlyph)+'</div>';
       if(state.markers[pid]){
@@ -1908,7 +1973,7 @@
     if(state.watchId !== null && navigator.geolocation){ navigator.geolocation.clearWatch(state.watchId); state.watchId = null; }
     if(state.writeTimer){ clearInterval(state.writeTimer); state.writeTimer = null; }
     if(state.pollTimer){ clearInterval(state.pollTimer); state.pollTimer = null; }
-    if(state.compassMode){ disableCompassMode(); state.compassMode = false; }
+    state.compassAngle = 0;
     if(state.map){ state.map.remove(); state.map = null; }
     state.markers = {};
     state.zonesLayers = {};
@@ -1922,7 +1987,6 @@
     if(state.watchId !== null && navigator.geolocation){ navigator.geolocation.clearWatch(state.watchId); state.watchId = null; }
     if(state.writeTimer){ clearInterval(state.writeTimer); state.writeTimer = null; }
     if(state.pollTimer){ clearInterval(state.pollTimer); state.pollTimer = null; }
-    if(state.compassMode){ disableCompassMode(); state.compassMode = false; }
     stopEditorGeoWatch();
   });
 
