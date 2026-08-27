@@ -546,6 +546,7 @@
     if(state.screen === "map") return renderMap();
     if(state.screen === "editor") return renderMapEditor();
     if(state.screen === "roles") return renderRoles();
+    if(state.screen === "reveal") return renderReveal();
   }
 
   function stopMapIfNeeded(){
@@ -1700,6 +1701,7 @@
     map.on('zoomend', applyLabelZoomVisibility);
     applyLabelZoomVisibility();
     applyCompassRotation();
+    setupMapRotateGesture(document.getElementById("map"));
     // Après un aller-retour entre écrans (ex. Code / QR puis retour), Leaflet peut mesurer
     // son conteneur avant que la mise en page ne soit tout à fait stabilisée, ce qui donne
     // une carte grise sans tuiles. On force un recalcul juste après.
@@ -1732,10 +1734,18 @@
     if(state.warzoneTickTimer){ clearInterval(state.warzoneTickTimer); state.warzoneTickTimer = null; }
   }
 
-  // ---------- Rotation manuelle de la carte (cadran à glisser, façon Google Maps) ----------
+  // ---------- Rotation manuelle de la carte (cadran + geste à deux doigts, façon Google Maps) ----------
   // Le capteur boussole des téléphones s'est révélé trop peu fiable (saccades, valeurs
-  // erratiques) — on laisse maintenant le joueur orienter la carte lui-même au doigt,
-  // ce qui est stable partout, sans dépendre du matériel.
+  // erratiques) — le joueur oriente lui-même la carte, ce qui est stable partout.
+  function recenterOnMeIfPossible(){
+    // Pour que la rotation pivote autour de "moi" (comme sur Google Maps) plutôt qu'autour
+    // du centre initial du terrain, on recentre la carte sur la position actuelle du joueur
+    // au moment où une rotation commence.
+    if(state.map && state.lastCoords){
+      state.map.panTo([state.lastCoords.lat, state.lastCoords.lng], { animate:false });
+    }
+  }
+
   function applyCompassRotation(){
     var mapEl = document.getElementById("map");
     if(mapEl) mapEl.style.transform = "rotate(" + (-state.compassAngle) + "deg)";
@@ -1768,6 +1778,7 @@
     dial.addEventListener("pointerdown", function(e){
       dragging = true;
       try{ dial.setPointerCapture(e.pointerId); }catch(err){}
+      recenterOnMeIfPossible();
       state.compassAngle = angleFromPoint(e.clientX, e.clientY);
       applyCompassRotation();
     });
@@ -1778,6 +1789,44 @@
     });
     dial.addEventListener("pointerup", function(){ dragging = false; });
     dial.addEventListener("pointercancel", function(){ dragging = false; });
+  }
+
+  // Geste à deux doigts directement sur la carte (comme Google Maps) : on se contente
+  // d'observer les deux points de contact pour calculer l'angle, sans jamais bloquer les
+  // événements — le pincement natif de Leaflet (zoom) continue donc de fonctionner en
+  // même temps, exactement comme sur Google Maps.
+  function setupMapRotateGesture(mapEl){
+    var startAngle = null, startCompass = 0, recentered = false;
+    function angleOf(t0, t1){
+      return Math.atan2(t1.clientY - t0.clientY, t1.clientX - t0.clientX) * 180 / Math.PI;
+    }
+    mapEl.addEventListener("touchstart", function(e){
+      if(e.touches.length === 2){
+        startAngle = angleOf(e.touches[0], e.touches[1]);
+        startCompass = state.compassAngle;
+        recentered = false;
+      } else {
+        startAngle = null;
+      }
+    }, { passive:true });
+    mapEl.addEventListener("touchmove", function(e){
+      if(e.touches.length === 2 && startAngle !== null){
+        var currentAngle = angleOf(e.touches[0], e.touches[1]);
+        var delta = currentAngle - startAngle;
+        // Ne recentre qu'à partir du moment où une vraie intention de rotation se confirme
+        // (pas sur un simple pincement de zoom, où l'angle entre les doigts bouge à peine).
+        if(!recentered && Math.abs(delta) > 3){
+          recenterOnMeIfPossible();
+          recentered = true;
+        }
+        state.compassAngle = ((startCompass + delta) % 360 + 360) % 360;
+        applyCompassRotation();
+      }
+    }, { passive:true });
+    mapEl.addEventListener("touchend", function(e){
+      if(e.touches.length < 2) startAngle = null;
+    }, { passive:true });
+    mapEl.addEventListener("touchcancel", function(){ startAngle = null; }, { passive:true });
   }
 
   // Bascule proprement entre géolocalisation réelle et mode test : l'une des
@@ -2145,6 +2194,24 @@
     if(state.pollTimer){ clearInterval(state.pollTimer); state.pollTimer = null; }
     stopWarzoneTicker();
     stopEditorGeoWatch();
+  });
+
+  // Passer portrait/paysage (ou juste le clavier qui s'ouvre/ferme) change la taille réelle
+  // de l'écran — sans ça, Leaflet garde en mémoire l'ancienne taille et affiche une zone
+  // noire/vide là où le nouvel espace n'est pas couvert, surtout visible en plein écran.
+  var _resizeTimer = null;
+  window.addEventListener("resize", function(){
+    clearTimeout(_resizeTimer);
+    _resizeTimer = setTimeout(function(){
+      if(state.map) state.map.invalidateSize();
+      if(state.editorMap) state.editorMap.invalidateSize();
+    }, 150);
+  });
+  window.addEventListener("orientationchange", function(){
+    setTimeout(function(){
+      if(state.map) state.map.invalidateSize();
+      if(state.editorMap) state.editorMap.invalidateSize();
+    }, 300);
   });
 
   render();
