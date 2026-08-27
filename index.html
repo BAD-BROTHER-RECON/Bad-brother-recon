@@ -144,7 +144,9 @@
   /* ---- Map screen ---- */
   .map-rotate-wrapper{ width:100%; height:52vh; min-height:300px; overflow:hidden; position:relative; border-radius:var(--radius); border:1px solid var(--line); background:var(--panel); }
   .map-rotate-wrapper.fullscreen{
-    position:fixed; inset:0; width:100vw; height:100vh; z-index:500; border-radius:0; border:none;
+    position:fixed; top:0; left:0; right:0; bottom:0;
+    width:100vw; height:100vh; height:100dvh;
+    z-index:500; border-radius:0; border:none;
   }
   #map{
     position:absolute; top:50%; left:50%;
@@ -159,6 +161,11 @@
     background:rgba(28,33,22,0.88); border:1px solid var(--line); color:var(--ink); font-size:17px; padding:0;
   }
   .map-rotate-wrapper.fullscreen .map-fullscreen-btn{ top:calc(env(safe-area-inset-top, 0px) + 10px); }
+  .warzone-banner-overlay{
+    position:absolute; top:8px; left:8px; right:54px; z-index:405;
+    display:flex; flex-direction:column; gap:6px; pointer-events:none;
+  }
+  .map-rotate-wrapper.fullscreen .warzone-banner-overlay{ top:calc(env(safe-area-inset-top, 0px) + 10px); right:calc(env(safe-area-inset-right, 0px) + 54px); left:calc(env(safe-area-inset-left, 0px) + 8px); }
   .status-bar{ display:flex; align-items:center; gap:8px; margin:10px 0; font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--ink-dim); letter-spacing:.05em; text-transform:uppercase; }
   .compass-row{ display:flex; align-items:center; gap:14px; margin-top:12px; }
   .compass-dial{
@@ -207,11 +214,11 @@
     font-family:'JetBrains Mono',monospace; font-size:11px; padding:6px; text-transform:uppercase;
   }
   .zone-legend{ display:flex; flex-wrap:wrap; gap:10px; font-family:'JetBrains Mono',monospace; font-size:10px; color:var(--ink-dim); text-transform:uppercase; letter-spacing:.04em; margin-top:8px; align-items:center; }
-  .warzone-alert{ margin-top:8px; padding:10px 14px; border-radius:var(--radius); border:1px solid; }
-  .warzone-alert.pending{ border-color:var(--amber-dim); background:rgba(201,162,39,0.10); color:var(--amber); }
-  .warzone-alert.active{ border-color:var(--danger); background:rgba(179,64,47,0.14); color:#f2a89a; animation: warzoneflash 1.6s ease-in-out infinite; }
-  .warzone-alert .wz-name{ font-family:'JetBrains Mono',monospace; font-size:11px; text-transform:uppercase; letter-spacing:.05em; opacity:.85; }
-  .warzone-alert .wz-time{ font-size:24px; font-weight:700; margin-top:2px; }
+  .warzone-alert{ padding:8px 12px; border-radius:var(--radius); border:1px solid; backdrop-filter: blur(2px); pointer-events:auto; }
+  .warzone-alert.pending{ border-color:var(--amber-dim); background:rgba(20,23,15,0.82); color:var(--amber); }
+  .warzone-alert.active{ border-color:var(--danger); background:rgba(35,15,12,0.85); color:#f2a89a; animation: warzoneflash 1.6s ease-in-out infinite; }
+  .warzone-alert .wz-name{ font-family:'JetBrains Mono',monospace; font-size:10px; text-transform:uppercase; letter-spacing:.05em; opacity:.85; }
+  .warzone-alert .wz-time{ font-size:20px; font-weight:700; margin-top:2px; }
   @keyframes warzoneflash{ 0%,100%{ opacity:1; } 50%{ opacity:.55; } }
   .zone-legend .dot{ width:8px; height:8px; }
   .leaflet-interactive.zone-objectif{ animation: zonepulse 1.6s ease-in-out infinite; }
@@ -982,6 +989,7 @@
     state.editorMap = map;
     state.editorLayers = {};
     startEditorGeoWatch();
+    setTimeout(function(){ if(state.editorMap) state.editorMap.invalidateSize(); }, 100);
 
     drawExistingZones();
     drawToolbar();
@@ -1613,9 +1621,8 @@
     var cfg = state.event;
     app.innerHTML =
       '<div class="topbar"><button class="back">‹ Quitter</button><div class="eyebrow">'+escapeHtml(cfg.name)+' · '+cfg.code+'</div></div>' +
-      '<div class="map-rotate-wrapper" id="map-wrapper"><div id="map"></div><button class="map-fullscreen-btn" id="btn-fullscreen-map" title="Plein écran">⛶</button></div>' +
+      '<div class="map-rotate-wrapper" id="map-wrapper"><div id="map"></div><button class="map-fullscreen-btn" id="btn-fullscreen-map" title="Plein écran">⛶</button><div id="warzone-banner" class="warzone-banner-overlay"></div></div>' +
       '<div class="status-bar"><span class="status-dot" id="status-dot"></span><span id="status-text">Initialisation…</span></div>' +
-      '<div id="warzone-banner"></div>' +
       '<div class="zone-legend">' +
         ZONE_STATUSES.map(function(s){ return '<span><span class="dot" style="background:'+s.color+'"></span> '+s.label+'</span>'; }).join("") +
       '</div>' +
@@ -1625,6 +1632,7 @@
         '<p style="margin:2px 0 0;">Fais glisser le cadran pour orienter la carte.</p>' +
         '<button class="btn btn-sm btn-ghost" id="btn-compass-reset" style="margin-top:6px;">↑ Nord en haut</button></div>' +
       '</div>' +
+      '<p id="compass-drag-hint" style="font-size:11px;color:var(--amber-dim);margin-top:4px;"></p>' +
       '<div class="test-toggle"><span class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">Mode test (clic sur la carte = ta position)</span>' +
         '<input type="checkbox" id="test-mode" '+(state.testMode?'checked':'')+' /></div>' +
       (state.player.squad ? '<div class="test-toggle"><span class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">Mon escouade seulement ('+escapeHtml(state.player.squad)+')</span>' +
@@ -1690,6 +1698,11 @@
     state.map = map;
     map.on('zoomend', applyLabelZoomVisibility);
     applyLabelZoomVisibility();
+    applyCompassRotation();
+    // Après un aller-retour entre écrans (ex. Code / QR puis retour), Leaflet peut mesurer
+    // son conteneur avant que la mise en page ne soit tout à fait stabilisée, ce qui donne
+    // une carte grise sans tuiles. On force un recalcul juste après.
+    setTimeout(function(){ if(state.map) state.map.invalidateSize(); }, 100);
 
     map.on('click', function(e){
       if(!state.testMode) return;
@@ -1726,6 +1739,16 @@
     var mapEl = document.getElementById("map");
     if(mapEl) mapEl.style.transform = "rotate(" + (-state.compassAngle) + "deg)";
     document.documentElement.style.setProperty("--compass-angle", state.compassAngle + "deg");
+
+    // Déplacer la carte au doigt pendant qu'elle est tournée inverserait le sens du geste
+    // (haut/bas, gauche/droite) — on désactive donc le glissement tant qu'elle n'est pas
+    // orientée Nord en haut, pour éviter cette confusion. Le zoom (pincement) reste possible.
+    var isNorth = (state.compassAngle < 2 || state.compassAngle > 358);
+    if(state.map){
+      if(isNorth) state.map.dragging.enable(); else state.map.dragging.disable();
+    }
+    var hint = document.getElementById("compass-drag-hint");
+    if(hint) hint.textContent = isNorth ? "" : "Déplacement désactivé pendant la rotation — remets Nord en haut pour te déplacer.";
   }
 
   function setupCompassDial(){
