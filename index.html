@@ -311,6 +311,8 @@
     editingZoneId: null,   // zone en cours de modification (poignées visibles) dans l'éditeur
     editorMeMarker: null,
     cachedZones: [],
+    modAuthed: false,
+    pendingLibraryHighlight: null,
     warzoneTickTimer: null,
     _draftZones: []
   };
@@ -485,6 +487,74 @@
     return storageSet(mapsIndexKey(), JSON.stringify(filtered));
   }
 
+  // ---------- Bibliothèque de cartes (partage entre organisateurs, modérée) ----------
+  function libraryIndexKey(){ return "library:index"; }
+  function libraryKey(id){ return "library:" + id; }
+  async function loadLibraryIndex(){
+    var raw = await storageGet(libraryIndexKey());
+    if(!raw) return [];
+    try{ return JSON.parse(raw); }catch(e){ return []; }
+  }
+  async function saveLibraryIndex(idx){ return storageSet(libraryIndexKey(), JSON.stringify(idx)); }
+  async function loadLibraryEntry(id){
+    var raw = await storageGet(libraryKey(id));
+    if(!raw) return null;
+    try{ return JSON.parse(raw); }catch(e){ return null; }
+  }
+  async function saveLibraryEntry(entry){
+    var ok = await storageSet(libraryKey(entry.id), JSON.stringify(entry));
+    if(!ok) return false;
+    var idx = await loadLibraryIndex();
+    var i = idx.findIndex(function(m){ return m.id === entry.id; });
+    var summary = { id: entry.id, name: entry.name, status: entry.status, starCount: entry.starCount||0, center: entry.center||null, zoneCount: entry.zones.length, supersedes: entry.supersedes||null, submittedAt: entry.submittedAt };
+    if(i>=0) idx[i]=summary; else idx.push(summary);
+    return saveLibraryIndex(idx);
+  }
+  async function deleteLibraryEntry(id){
+    await storageDelete(libraryKey(id));
+    var idx = await loadLibraryIndex();
+    return saveLibraryIndex(idx.filter(function(m){ return m.id !== id; }));
+  }
+  async function shareToLibrary(templateId, supersedesId){
+    var tpl = await loadMapTemplate(templateId);
+    if(!tpl) return false;
+    var entry = {
+      id: genId("lib"), name: tpl.name, zones: tpl.zones, center: tpl.center || null,
+      status: "pending", starCount: 0, supersedes: supersedesId || null, submittedAt: Date.now()
+    };
+    return saveLibraryEntry(entry) ? entry.id : false;
+  }
+  async function voteLibraryEntry(id){
+    var entry = await loadLibraryEntry(id);
+    if(!entry) return false;
+    entry.starCount = (entry.starCount||0) + 1;
+    return saveLibraryEntry(entry);
+  }
+  async function approveLibraryEntry(id){
+    var entry = await loadLibraryEntry(id);
+    if(!entry) return false;
+    entry.status = "approved";
+    entry.approvedAt = Date.now();
+    return saveLibraryEntry(entry);
+  }
+  function hasVotedLocally(id){
+    try{ return (JSON.parse(localStorage.getItem("badRecon_votedMaps")||"[]")).indexOf(id) !== -1; }catch(e){ return false; }
+  }
+  function markVotedLocally(id){
+    try{
+      var arr = JSON.parse(localStorage.getItem("badRecon_votedMaps")||"[]");
+      if(arr.indexOf(id) === -1){ arr.push(id); localStorage.setItem("badRecon_votedMaps", JSON.stringify(arr)); }
+    }catch(e){}
+  }
+
+  function moderationCodeKey(){ return "moderation:code"; }
+  async function loadModerationCode(){
+    var raw = await storageGet(moderationCodeKey());
+    if(!raw) return "BADMOD2024";
+    try{ return JSON.parse(raw); }catch(e){ return "BADMOD2024"; }
+  }
+  async function saveModerationCode(code){ return storageSet(moderationCodeKey(), JSON.stringify(code)); }
+
   // ---------- Rôles & visibilité ----------
   function eventVisibilityKey(code){ return "event:" + code + ":visibility"; }
   async function loadVisibility(code){
@@ -547,6 +617,8 @@
     if(state.screen === "editor") return renderMapEditor();
     if(state.screen === "roles") return renderRoles();
     if(state.screen === "reveal") return renderReveal();
+    if(state.screen === "library") return renderLibrary();
+    if(state.screen === "moderation") return renderModeration();
   }
 
   function stopMapIfNeeded(){
@@ -570,6 +642,8 @@
         '<button class="btn btn-primary" id="btn-create">Créer un événement</button>' +
         '<div class="eyebrow" style="margin-top:8px;">Joueur</div>' +
         '<button class="btn" id="btn-join">Rejoindre une partie</button>' +
+        '<div class="eyebrow" style="margin-top:8px;">Terrains</div>' +
+        '<button class="btn btn-ghost" id="btn-library">📚 Bibliothèque de cartes</button>' +
       '</div>' +
       (LIBS_OK.leaflet && LIBS_OK.qrcode && LIBS_OK.jsqr ? '' :
         '<div class="banner warn">Certaines ressources externes (carte, QR) n\'ont pas pu se charger. Vérifie ta connexion internet et recharge la page.</div>') +
@@ -580,6 +654,7 @@
     document.getElementById("btn-perms").onclick = function(){ requestAllPermissions("perm-status"); };
     document.getElementById("btn-create").onclick = function(){ state.screen="create"; render(); };
     document.getElementById("btn-join").onclick = function(){ state.screen="join"; render(); };
+    document.getElementById("btn-library").onclick = function(){ state.screen="library"; render(); };
   }
 
   // Demande position + caméra en un seul geste (un seul bouton, un seul aller-retour
@@ -1467,7 +1542,7 @@
     document.getElementById("btn-confirm-save-map").onclick = async function(){
       var name = input.value.trim();
       if(!name) return;
-      var tpl = { id: genId("map"), name: name, zones: state.editorZones.filter(function(z){ return z.kind !== "guerre"; }).map(function(z){
+      var tpl = { id: genId("map"), name: name, center: state.editorCenter || null, zones: state.editorZones.filter(function(z){ return z.kind !== "guerre"; }).map(function(z){
         if(z.kind === "point"){ return { kind:"point", name:z.name, latlng:z.latlng, icon:z.icon, color:z.color }; }
         return { kind: z.kind || "building", name: z.name, points: z.points };
       }) };
@@ -1619,12 +1694,268 @@
     }
   }
 
+  // ---------- Écran Bibliothèque de cartes ----------
+  function renderLibrary(){
+    app.innerHTML =
+      '<div class="topbar"><button class="back">‹ Retour</button><div class="eyebrow">Bibliothèque de cartes</div></div>' +
+      '<div class="field"><input type="text" id="lib-search" placeholder="Rechercher un terrain par nom…" /></div>' +
+      '<div class="map-rotate-wrapper" style="height:38vh;"><div id="lib-map"></div></div>' +
+      '<div id="lib-list" class="zone-list" style="margin-top:12px;"></div>' +
+      '<div class="row" style="margin-top:14px;">' +
+        '<button class="btn btn-sm btn-ghost" id="btn-share-map">Partager une de mes cartes</button>' +
+        '<button class="btn btn-sm btn-ghost" id="btn-go-moderation">🛡 Modération</button>' +
+      '</div>' +
+      '<div id="lib-banner"></div>';
+
+    var libMap = null, libMarkers = {}, allEntries = [];
+
+    function teardownLibraryMap(){ if(libMap){ libMap.remove(); libMap = null; } }
+
+    document.querySelector(".back").onclick = function(){ teardownLibraryMap(); state.screen="home"; render(); };
+    document.getElementById("btn-go-moderation").onclick = function(){ teardownLibraryMap(); state.screen="moderation"; render(); };
+
+    if(LIBS_OK.leaflet){
+      libMap = L.map('lib-map', { zoomControl:true }).setView([46.6, 2.5], 5);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom:19, attribution:'&copy; OpenStreetMap' }).addTo(libMap);
+      setTimeout(function(){ if(libMap) libMap.invalidateSize(); }, 100);
+    }
+
+    function highlightRow(id){
+      var row = document.getElementById("lib-row-"+id);
+      if(!row) return;
+      row.scrollIntoView({ behavior:"smooth", block:"center" });
+      row.style.transition = "background 0.3s";
+      row.style.background = "rgba(201,162,39,0.25)";
+      setTimeout(function(){ row.style.background = ""; }, 1200);
+    }
+
+    function renderPins(filtered){
+      if(!libMap) return;
+      Object.keys(libMarkers).forEach(function(id){ libMap.removeLayer(libMarkers[id]); });
+      libMarkers = {};
+      var withCenter = filtered.filter(function(e){ return e.center && typeof e.center.lat === "number"; });
+      withCenter.forEach(function(entry){
+        var icon = L.divIcon({ html:'<div style="font-size:22px;line-height:1;">🚩</div>', className:'', iconSize:[24,24], iconAnchor:[12,22] });
+        var marker = L.marker([entry.center.lat, entry.center.lng], { icon: icon }).addTo(libMap).bindTooltip(escapeHtml(entry.name));
+        marker.on("click", function(){ highlightRow(entry.id); });
+        libMarkers[entry.id] = marker;
+      });
+      if(withCenter.length){
+        var bounds = L.latLngBounds(withCenter.map(function(e){ return [e.center.lat, e.center.lng]; }));
+        libMap.fitBounds(bounds, { padding:[30,30], maxZoom:14 });
+      }
+    }
+
+    function renderList(filtered){
+      var listEl = document.getElementById("lib-list");
+      if(!filtered.length){
+        listEl.innerHTML = '<p>Aucun terrain trouvé.</p>';
+        return;
+      }
+      listEl.innerHTML = filtered.map(function(entry){
+        var voted = hasVotedLocally(entry.id);
+        return '<div class="zone-row" id="lib-row-'+entry.id+'" style="flex-wrap:wrap;gap:6px;">' +
+          '<span class="name">'+escapeHtml(entry.name)+' <span class="mono" style="font-size:10px;color:var(--ink-dim);">· '+(entry.zoneCount||0)+' élém. · ⭐ '+(entry.starCount||0)+'</span></span>' +
+          '<button class="btn btn-sm btn-primary lib-use" data-id="'+entry.id+'">Utiliser</button>' +
+          '<button class="btn btn-sm btn-ghost lib-vote" data-id="'+entry.id+'" '+(voted?'disabled':'')+'>'+(voted?'✓':'⭐')+'</button>' +
+          '<button class="btn btn-sm btn-ghost lib-share" data-id="'+entry.id+'">🔗</button>' +
+        '</div>';
+      }).join("");
+
+      Array.prototype.forEach.call(listEl.querySelectorAll(".lib-use"), function(btn){
+        btn.onclick = async function(){
+          var entry = await loadLibraryEntry(btn.dataset.id);
+          if(!entry) return;
+          state._draftName = entry.name;
+          state._draftCenter = entry.center || null;
+          state._draftZones = entry.zones.map(function(z){
+            if(z.kind === "point") return { id: genId("pt"), kind:"point", name:z.name, latlng:z.latlng, icon:z.icon, color:z.color };
+            if(z.kind === "terrain") return { id: genId("t"), kind:"terrain", name: z.name||"Limite du terrain", points: z.points };
+            return { id: genId("z"), kind:"building", name: z.name, points: z.points, status:"intact" };
+          });
+          teardownLibraryMap();
+          state.screen = "create";
+          render();
+        };
+      });
+      Array.prototype.forEach.call(listEl.querySelectorAll(".lib-vote"), function(btn){
+        btn.onclick = async function(){
+          await voteLibraryEntry(btn.dataset.id);
+          markVotedLocally(btn.dataset.id);
+          loadAndRender();
+        };
+      });
+      Array.prototype.forEach.call(listEl.querySelectorAll(".lib-share"), function(btn){
+        btn.onclick = function(){
+          var url = location.origin + location.pathname + "?map=" + btn.dataset.id;
+          if(navigator.clipboard) navigator.clipboard.writeText(url);
+          var old = btn.textContent;
+          btn.textContent = "Copié ✓";
+          setTimeout(function(){ btn.textContent = old; }, 1500);
+        };
+      });
+    }
+
+    function applyFilter(){
+      var q = (document.getElementById("lib-search").value||"").trim().toLowerCase();
+      var filtered = q ? allEntries.filter(function(e){ return e.name.toLowerCase().indexOf(q) !== -1; }) : allEntries;
+      renderList(filtered);
+      renderPins(filtered);
+    }
+
+    async function loadAndRender(){
+      var idx = await loadLibraryIndex();
+      allEntries = idx.filter(function(e){ return e.status === "approved"; });
+      applyFilter();
+      if(state.pendingLibraryHighlight){
+        var target = state.pendingLibraryHighlight;
+        state.pendingLibraryHighlight = null;
+        setTimeout(function(){ highlightRow(target); }, 400);
+      }
+    }
+    document.getElementById("lib-search").oninput = applyFilter;
+    loadAndRender();
+
+    document.getElementById("btn-share-map").onclick = async function(){
+      var idx = await loadMapsIndex();
+      var banner = document.getElementById("lib-banner");
+      if(!idx.length){
+        banner.innerHTML = '<div class="banner">Aucune carte enregistrée pour l\u2019instant — enregistre-en une depuis l\u2019éditeur de carte.</div>';
+        return;
+      }
+      banner.innerHTML = '<div class="panel" style="margin-top:10px;"><label class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">Choisis une carte à proposer</label>' +
+        '<div class="zone-list" style="margin-top:8px;">' +
+        idx.map(function(m){ return '<div class="zone-row"><span class="name">'+escapeHtml(m.name)+'</span><button class="btn btn-sm btn-primary share-pick" data-id="'+m.id+'">Proposer</button></div>'; }).join("") +
+        '</div></div>';
+      Array.prototype.forEach.call(banner.querySelectorAll(".share-pick"), function(btn){
+        btn.onclick = async function(){
+          var tpl = await loadMapTemplate(btn.dataset.id);
+          if(tpl && !tpl.center){
+            banner.innerHTML = '<div class="banner warn">Cette carte a été enregistrée avant l\u2019ajout de la localisation — recharge-la dans l\u2019éditeur puis réenregistre-la pour pouvoir la partager.</div>';
+            return;
+          }
+          var id = await shareToLibrary(btn.dataset.id, null);
+          banner.innerHTML = id
+            ? '<div class="banner info">Carte proposée — elle apparaîtra dans la bibliothèque une fois validée par un modérateur.</div>'
+            : '<div class="banner warn">Échec de l\u2019envoi.</div>';
+        };
+      });
+    };
+  }
+
+  // ---------- Écran Modération (accès protégé par code) ----------
+  function renderModeration(){
+    app.innerHTML =
+      '<div class="topbar"><button class="back">‹ Retour</button><div class="eyebrow">Modération</div></div>' +
+      (!state.modAuthed
+        ? '<div class="panel"><div class="field" style="margin-top:0;"><label>Code modérateur</label><input type="password" id="mod-code" placeholder="Code" /></div>' +
+          '<button class="btn btn-primary" id="btn-mod-auth" style="margin-top:8px;">Valider</button></div>' +
+          '<div id="mod-auth-banner"></div>'
+        : '<div id="mod-content"></div>');
+
+    document.querySelector(".back").onclick = function(){ state.screen="library"; render(); };
+
+    if(!state.modAuthed){
+      document.getElementById("btn-mod-auth").onclick = async function(){
+        var input = document.getElementById("mod-code").value.trim();
+        var real = await loadModerationCode();
+        if(input && input === real){ state.modAuthed = true; render(); }
+        else{ document.getElementById("mod-auth-banner").innerHTML = '<div class="banner warn">Code incorrect.</div>'; }
+      };
+      return;
+    }
+
+    loadModContent();
+  }
+
+  async function renderModPreview(id){
+    if(!LIBS_OK.leaflet) return;
+    var entry = await loadLibraryEntry(id);
+    var container = document.getElementById("mod-preview-"+id);
+    if(!entry || !container) return;
+    var center = entry.center || { lat:0, lng:0 };
+    var pm = L.map(container, { zoomControl:false, attributionControl:false, dragging:false, scrollWheelZoom:false, tap:false }).setView([center.lat, center.lng], 16);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom:19 }).addTo(pm);
+    entry.zones.forEach(function(z){
+      try{ addZoneLayer(pm, Object.assign({ id: genId("prev") }, z)); }catch(e){}
+    });
+    setTimeout(function(){ pm.invalidateSize(); }, 50);
+  }
+
+  async function loadModContent(){
+    var el = document.getElementById("mod-content");
+    el.innerHTML = '<p class="mono" style="font-size:11px;color:var(--ink-dim);">Chargement…</p>';
+    var idx = await loadLibraryIndex();
+    var pending = idx.filter(function(m){ return m.status === "pending"; });
+    var approved = idx.filter(function(m){ return m.status === "approved"; });
+
+    el.innerHTML =
+      '<div class="panel"><label class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">En attente ('+pending.length+')</label>' +
+      '<div id="mod-pending" style="margin-top:8px;"></div></div>' +
+      '<div class="panel" style="margin-top:14px;"><label class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">Cartes approuvées ('+approved.length+')</label>' +
+      '<div id="mod-approved" style="margin-top:8px;"></div></div>' +
+      '<div class="panel" style="margin-top:14px;"><label class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">Code modérateur</label>' +
+      '<div class="field" style="margin-top:6px;"><input type="text" id="mod-new-code" placeholder="Nouveau code" /></div>' +
+      '<button class="btn btn-sm btn-ghost" id="btn-mod-change-code" style="margin-top:6px;">Changer le code</button>' +
+      '<div id="mod-code-banner"></div></div>';
+
+    var pendingEl = document.getElementById("mod-pending");
+    if(!pending.length){
+      pendingEl.innerHTML = '<p>Rien à valider pour l\u2019instant.</p>';
+    } else {
+      pendingEl.innerHTML = pending.map(function(m){
+        return '<div class="panel" style="margin-top:8px;">' +
+          '<div class="zone-row"><span class="name">'+escapeHtml(m.name)+'</span><span class="mono" style="font-size:10px;color:var(--ink-dim);">'+(m.zoneCount||0)+' élém.</span></div>' +
+          (m.supersedes ? '<p style="font-size:11px;color:var(--amber);">Propose de remplacer une carte déjà approuvée.</p>' : '') +
+          '<div id="mod-preview-'+m.id+'" style="height:180px;border-radius:var(--radius);overflow:hidden;margin-top:6px;border:1px solid var(--line);"></div>' +
+          '<div class="row" style="margin-top:8px;">' +
+            '<button class="btn btn-sm btn-primary mod-approve" data-id="'+m.id+'">Accepter</button>' +
+            '<button class="btn btn-sm btn-ghost mod-reject" data-id="'+m.id+'">Rejeter</button>' +
+          '</div>' +
+        '</div>';
+      }).join("");
+      pending.forEach(function(m){ renderModPreview(m.id); });
+      Array.prototype.forEach.call(pendingEl.querySelectorAll(".mod-approve"), function(btn){
+        btn.onclick = async function(){ await approveLibraryEntry(btn.dataset.id); loadModContent(); };
+      });
+      Array.prototype.forEach.call(pendingEl.querySelectorAll(".mod-reject"), function(btn){
+        btn.onclick = async function(){
+          if(!confirm("Rejeter et supprimer cette proposition ?")) return;
+          await deleteLibraryEntry(btn.dataset.id);
+          loadModContent();
+        };
+      });
+    }
+
+    var approvedEl = document.getElementById("mod-approved");
+    approvedEl.innerHTML = approved.length ? approved.map(function(m){
+      return '<div class="zone-row"><span class="name">'+escapeHtml(m.name)+' <span class="mono" style="font-size:10px;color:var(--ink-dim);">· ⭐'+(m.starCount||0)+'</span></span>' +
+        '<button class="btn btn-sm btn-ghost mod-remove" data-id="'+m.id+'">Retirer</button></div>';
+    }).join("") : '<p>Aucune carte approuvée pour l\u2019instant.</p>';
+    Array.prototype.forEach.call(approvedEl.querySelectorAll(".mod-remove"), function(btn){
+      btn.onclick = async function(){
+        if(!confirm("Retirer cette carte de la bibliothèque ?")) return;
+        await deleteLibraryEntry(btn.dataset.id);
+        loadModContent();
+      };
+    });
+
+    document.getElementById("btn-mod-change-code").onclick = async function(){
+      var val = document.getElementById("mod-new-code").value.trim();
+      var banner = document.getElementById("mod-code-banner");
+      if(!val){ banner.innerHTML = '<div class="banner warn">Entre un nouveau code.</div>'; return; }
+      await saveModerationCode(val);
+      banner.innerHTML = '<div class="banner info">Code changé.</div>';
+    };
+  }
+
   function renderMap(){
     var cfg = state.event;
     app.innerHTML =
       '<div class="topbar"><button class="back">‹ Quitter</button><div class="eyebrow">'+escapeHtml(cfg.name)+' · '+cfg.code+'</div></div>' +
       '<div class="map-rotate-wrapper" id="map-wrapper"><div id="map"></div><button class="map-fullscreen-btn" id="btn-fullscreen-map" title="Plein écran">⛶</button><div id="warzone-banner" class="warzone-banner-overlay"></div></div>' +
       '<div class="status-bar"><span class="status-dot" id="status-dot"></span><span id="status-text">Initialisation…</span></div>' +
+      '<p id="zone-danger-note" class="mono" style="font-size:11px;color:#f2a89a;margin-top:4px;"></p>' +
       '<div class="zone-legend">' +
         ZONE_STATUSES.map(function(s){ return '<span><span class="dot" style="background:'+s.color+'"></span> '+s.label+'</span>'; }).join("") +
       '</div>' +
@@ -2055,6 +2386,37 @@
         '<div class="wz-time">'+wz.label+'</div>' +
       '</div>';
     }).join("");
+    updateZoneDangerNote(zones);
+  }
+
+  // Repère (algorithme du lancer de rayon) si un point est à l'intérieur d'un polygone.
+  function pointInPolygon(lat, lng, points){
+    var inside = false;
+    for(var i=0, j=points.length-1; i<points.length; j=i++){
+      var yi = points[i][0], xi = points[i][1];
+      var yj = points[j][0], xj = points[j][1];
+      var intersect = ((yi > lat) !== (yj > lat)) &&
+        (lng < (xj - xi) * (lat - yi) / (yj - yi) + xi);
+      if(intersect) inside = !inside;
+    }
+    return inside;
+  }
+
+  // Purement informatif — jamais une règle stricte (élimination automatique, etc.) : le
+  // GPS d'un téléphone est précis à quelques mètres près, pas assez pour trancher seul.
+  // Ça sert juste à fluidifier le jeu, pas à remplacer l'observation sur le terrain.
+  function updateZoneDangerNote(zones){
+    var el = document.getElementById("zone-danger-note");
+    if(!el) return;
+    if(!state.lastCoords){ el.textContent = ""; return; }
+    var inside = null;
+    (zones||[]).forEach(function(z){
+      if(z.kind === "guerre" && isValidZone(z)){
+        var wz = warzoneStyle(z);
+        if(wz.active && pointInPolygon(state.lastCoords.lat, state.lastCoords.lng, z.points)) inside = z.name;
+      }
+    });
+    el.textContent = inside ? ("⚠ Tu sembles être dans « "+inside+" » (zone interdite) — le GPS peut être imprécis de quelques mètres, vérifie visuellement.") : "";
   }
 
   function isValidZone(z){
@@ -2213,6 +2575,12 @@
       if(state.editorMap) state.editorMap.invalidateSize();
     }, 300);
   });
+
+  // Ouverture via un lien de partage (🔗) : "?map=<id>" — direction directe vers la bibliothèque.
+  try{
+    var sharedMapId = new URLSearchParams(location.search).get("map");
+    if(sharedMapId){ state.screen = "library"; state.pendingLibraryHighlight = sharedMapId; }
+  }catch(e){}
 
   render();
 })();
