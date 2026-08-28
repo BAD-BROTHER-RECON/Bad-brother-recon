@@ -404,6 +404,18 @@
 
   function eventConfigKey(code){ return "event:" + code + ":config"; }
   function eventPlayersKey(code){ return "event:" + code + ":players"; }
+  function eventLogKey(code){ return "event:" + code + ":log"; }
+  async function loadEventLog(code){
+    var raw = await storageGet(eventLogKey(code));
+    if(!raw) return [];
+    try{ return JSON.parse(raw); }catch(e){ return []; }
+  }
+  async function appendEventLog(code, entry){
+    var log = await loadEventLog(code);
+    log.push(entry);
+    if(log.length > 200) log = log.slice(log.length - 200);
+    return storageSet(eventLogKey(code), JSON.stringify(log));
+  }
 
   async function loadEventConfig(code){
     var raw = await storageGet(eventConfigKey(code));
@@ -619,6 +631,8 @@
     if(state.screen === "reveal") return renderReveal();
     if(state.screen === "library") return renderLibrary();
     if(state.screen === "moderation") return renderModeration();
+    if(state.screen === "log") return renderLog();
+    if(state.screen === "log") return renderLog();
   }
 
   function stopMapIfNeeded(){
@@ -1148,6 +1162,10 @@
     var layer;
     if(z.kind === "point"){
       layer = L.marker(z.latlng, { icon: pointDivIcon(z) }).addTo(map).bindTooltip(escapeHtml(z.name));
+      layer.on('click', function(){
+        var label = distanceLabel(z.latlng[0], z.latlng[1]);
+        if(label) layer.bindPopup(escapeHtml(z.name) + ' — ' + label).openPopup();
+      });
     } else if(z.kind === "terrain"){
       layer = L.polygon(z.points, { color:'#c9a227', weight:2, dashArray:'6,6', fillOpacity:0.04 })
         .addTo(map).bindTooltip(escapeHtml(z.name || "Limite du terrain"));
@@ -1157,6 +1175,10 @@
         color: wz.color, weight: wz.weight, fillColor: wz.color, fillOpacity: wz.fillOpacity,
         dashArray: wz.dashArray, className: wz.active ? 'zone-objectif' : ''
       }).addTo(map).bindTooltip(escapeHtml(z.name) + ' · ' + wz.label);
+    } else if(z.kind === "mur" || z.kind === "demimur"){
+      var isHalf = z.kind === "demimur";
+      layer = L.polyline(z.points, { color:'#8b9184', weight: isHalf ? 3 : 5, dashArray: isHalf ? '5,5' : null })
+        .addTo(map).bindTooltip(escapeHtml(z.name || (isHalf ? "Demi-mur" : "Mur")));
     } else {
       var info = zoneStatusInfo(z.status);
       layer = L.polygon(z.points, {
@@ -1195,12 +1217,14 @@
 
     var isTerrain = z.kind === "terrain";
     var isWarzone = z.kind === "guerre";
-    var style;
+    var isWall = z.kind === "mur" || z.kind === "demimur";
+    var style, useLine = false;
     if(isTerrain){ style = { color:'#c9a227', weight:2, dashArray:'6,6', fillOpacity:0.04 }; }
     else if(isWarzone){ var wz = warzoneStyle(z); style = { color: wz.color, weight: wz.weight, fillColor: wz.color, fillOpacity: wz.fillOpacity, dashArray: wz.dashArray }; }
+    else if(isWall){ useLine = true; var isHalf = z.kind === "demimur"; style = { color:'#8b9184', weight: isHalf?3:5, dashArray: isHalf?'5,5':null }; }
     else{ var info = zoneStatusInfo(z.status); style = { color: info.color, weight:2, fillColor: info.color, fillOpacity:0.28 }; }
-    var tooltipTxt = isTerrain ? (z.name || "Limite du terrain") : (isWarzone ? (z.name + ' · ' + warzoneStyle(z).label) : z.name);
-    var poly = L.polygon(z.points, style).addTo(map).bindTooltip(escapeHtml(tooltipTxt));
+    var tooltipTxt = isTerrain ? (z.name || "Limite du terrain") : (isWarzone ? (z.name + ' · ' + warzoneStyle(z).label) : (isWall ? (z.name || (z.kind==="demimur"?"Demi-mur":"Mur")) : z.name));
+    var poly = (useLine ? L.polyline(z.points, style) : L.polygon(z.points, style)).addTo(map).bindTooltip(escapeHtml(tooltipTxt));
     poly.on('click', function(){
       state.editingZoneId = isEditingThis ? null : z.id;
       drawExistingZones();
@@ -1224,10 +1248,11 @@
   }
 
   function orderedZones(zones){
-    // la limite de terrain d'abord (dessous), puis les zones de guerre, puis les bâtiments, puis les points (dessus)
+    // la limite de terrain d'abord (dessous), puis les zones de guerre, puis les bâtiments, puis les murs, puis les points (dessus)
     return zones.filter(function(z){ return z.kind === "terrain"; })
       .concat(zones.filter(function(z){ return z.kind === "guerre"; }))
       .concat(zones.filter(function(z){ return z.kind === "building" || !z.kind; }))
+      .concat(zones.filter(function(z){ return z.kind === "mur" || z.kind === "demimur"; }))
       .concat(zones.filter(function(z){ return z.kind === "point"; }));
   }
 
@@ -1250,8 +1275,11 @@
     if(!state.editorMap) return;
     if(state.drawLayer){ state.editorMap.removeLayer(state.drawLayer); state.drawLayer = null; }
     if(state.drawPoints.length){
-      var color = state.drawKind === "terrain" ? "#c9a227" : "#3b82c4";
-      state.drawLayer = L.polygon(state.drawPoints, { color:color, dashArray:'4,4', weight:2, fillOpacity:0.12 }).addTo(state.editorMap);
+      var isWallKind = state.drawKind === "mur" || state.drawKind === "demimur";
+      var color = state.drawKind === "terrain" ? "#c9a227" : (isWallKind ? "#8b9184" : "#3b82c4");
+      state.drawLayer = isWallKind
+        ? L.polyline(state.drawPoints, { color:color, dashArray:'4,4', weight:3 }).addTo(state.editorMap)
+        : L.polygon(state.drawPoints, { color:color, dashArray:'4,4', weight:2, fillOpacity:0.12 }).addTo(state.editorMap);
     }
   }
 
@@ -1281,25 +1309,33 @@
           '<button class="btn btn-sm btn-ghost" id="btn-start-point">+ Point</button>' +
         '</div>' +
         '<div class="row" style="margin-top:6px;">' +
+          '<button class="btn btn-sm btn-ghost" id="btn-start-wall">🧱 Mur</button>' +
+          '<button class="btn btn-sm btn-ghost" id="btn-start-halfwall">⬜ Demi-mur</button>' +
+        '</div>' +
+        '<div class="row" style="margin-top:6px;">' +
           '<button class="btn btn-sm btn-ghost" id="btn-start-warzone">☠ Zone de guerre</button>' +
         '</div>';
       document.getElementById("btn-start-terrain").onclick = function(){ state.editingZoneId = null; state.drawing = true; state.drawKind = "terrain"; state.drawPoints = []; drawExistingZones(); drawToolbar(); };
       document.getElementById("btn-start-draw").onclick = function(){ state.editingZoneId = null; state.drawing = true; state.drawKind = "building"; state.drawPoints = []; drawExistingZones(); drawToolbar(); };
       document.getElementById("btn-start-point").onclick = function(){ state.editingZoneId = null; state.placingPoint = true; drawExistingZones(); drawToolbar(); };
+      document.getElementById("btn-start-wall").onclick = function(){ state.editingZoneId = null; state.drawing = true; state.drawKind = "mur"; state.drawPoints = []; drawExistingZones(); drawToolbar(); };
+      document.getElementById("btn-start-halfwall").onclick = function(){ state.editingZoneId = null; state.drawing = true; state.drawKind = "demimur"; state.drawPoints = []; drawExistingZones(); drawToolbar(); };
       document.getElementById("btn-start-warzone").onclick = function(){ state.editingZoneId = null; state.drawing = true; state.drawKind = "guerre"; state.drawPoints = []; drawExistingZones(); drawToolbar(); };
       return;
     }
 
-    var label = state.drawKind === "terrain" ? "coin de la limite du terrain" : (state.drawKind === "guerre" ? "coin de la zone de guerre" : "coin du bâtiment");
+    var isWallKind = state.drawKind === "mur" || state.drawKind === "demimur";
+    var minPts = isWallKind ? 2 : 3;
+    var label = state.drawKind === "terrain" ? "coin de la limite du terrain" : (state.drawKind === "guerre" ? "coin de la zone de guerre" : (isWallKind ? "point du tracé" : "coin du bâtiment"));
     el.innerHTML =
-      '<span class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">Points placés : '+state.drawPoints.length+' (min. 3)</span>' +
+      '<span class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">Points placés : '+state.drawPoints.length+' (min. '+minPts+')</span>' +
       '<div class="row" style="margin-top:6px;">' +
-        '<button class="btn btn-sm btn-primary" id="btn-finish-draw"'+(state.drawPoints.length<3?' disabled':'')+'>Terminer</button>' +
+        '<button class="btn btn-sm btn-primary" id="btn-finish-draw"'+(state.drawPoints.length<minPts?' disabled':'')+'>Terminer</button>' +
         '<button class="btn btn-sm btn-ghost" id="btn-cancel-draw">Annuler</button>' +
       '</div>' +
       (state.lastCoords ? '<button class="btn btn-sm btn-ghost" id="btn-gps-vertex" style="margin-top:6px;">📍 Ajouter ma position GPS ici</button>' : '') +
-      '<p style="margin-top:6px;">Touche la carte pour placer chaque '+label+', ou déplace-toi sur place et utilise ta position GPS.</p>';
-    if(state.drawPoints.length>=3){
+      '<p style="margin-top:6px;">'+(isWallKind ? 'Touche la carte pour tracer le mur point par point (pas besoin de refermer la forme), ou déplace-toi sur place et utilise ta position GPS.' : ('Touche la carte pour placer chaque '+label+', ou déplace-toi sur place et utilise ta position GPS.'))+'</p>';
+    if(state.drawPoints.length>=minPts){
       document.getElementById("btn-finish-draw").onclick = finishDrawing;
     }
     var gpsVertexBtn = document.getElementById("btn-gps-vertex");
@@ -1317,12 +1353,16 @@
   }
 
   function finishDrawing(){
-    if(state.drawPoints.length < 3) return;
+    var isWallKind = state.drawKind === "mur" || state.drawKind === "demimur";
+    var minPts = isWallKind ? 2 : 3;
+    if(state.drawPoints.length < minPts) return;
     var isTerrain = state.drawKind === "terrain";
     var isWarzone = state.drawKind === "guerre";
     var el = document.getElementById("editor-toolbar");
+    var nameLabel = isWarzone ? "de la zone" : (isWallKind ? (state.drawKind==="demimur"?"du demi-mur":"du mur") : "du bâtiment");
+    var namePlaceholder = isWarzone ? "Ex. Secteur Nord" : (isWallKind ? "Ex. Mur Est" : "Ex. Hangar Nord");
     el.innerHTML =
-      (isTerrain ? '' : '<div class="field" style="margin-top:0;"><label>Nom '+(isWarzone?'de la zone':'du bâtiment')+' (optionnel)</label><input type="text" id="zone-name" placeholder="'+(isWarzone?'Ex. Secteur Nord':'Ex. Hangar Nord')+'" /></div>') +
+      (isTerrain ? '' : '<div class="field" style="margin-top:0;"><label>Nom '+nameLabel+' (optionnel)</label><input type="text" id="zone-name" placeholder="'+namePlaceholder+'" /></div>') +
       (isWarzone ? '<div class="field"><label>Devient interdite dans (minutes)</label><input type="number" id="zone-minutes" value="5" min="1" style="text-align:left;" /></div>' : '') +
       '<div class="row" style="margin-top:8px;">' +
         '<button class="btn btn-sm btn-primary" id="btn-confirm-zone">'+(isTerrain ? 'Valider la limite' : 'Ajouter')+'</button>' +
@@ -1344,6 +1384,9 @@
         var minutesInput = document.getElementById("zone-minutes");
         var minutes = Math.max(1, parseInt(minutesInput && minutesInput.value, 10) || 5);
         state.editorZones.push({ id: genId("w"), kind: "guerre", name: name2, points: state.drawPoints.slice(), deactivateAt: Date.now() + minutes*60000 });
+      } else if(isWallKind){
+        var name3 = nameInput && nameInput.value.trim() ? nameInput.value.trim() : (state.drawKind==="demimur" ? "Demi-mur" : "Mur");
+        state.editorZones.push({ id: genId("w"), kind: state.drawKind, name: name3, points: state.drawPoints.slice() });
       } else {
         var name = nameInput && nameInput.value.trim() ? nameInput.value.trim() : "Bâtiment";
         state.editorZones.push({ id: genId("z"), kind: "building", name: name, points: state.drawPoints.slice(), status: "intact" });
@@ -1442,6 +1485,13 @@
           '<span class="dot" style="background:'+wz.color+'"></span>' +
           '<span class="name">'+escapeHtml(z.name)+' <span class="mono" style="font-size:10px;color:var(--ink-dim);">· '+wz.label+'</span></span>' +
           (wz.active ? '' : '<button class="btn btn-sm btn-ghost warzone-now" data-id="'+z.id+'" style="padding:6px 10px;">Fermer maintenant</button>') +
+          '<button class="remove-chip zone-del" data-id="'+z.id+'">✕</button>' +
+        '</div>';
+      }
+      if(z.kind === "mur" || z.kind === "demimur"){
+        return '<div class="zone-row">' +
+          '<span style="font-size:14px;">'+(z.kind==="demimur"?"⬜":"🧱")+'</span>' +
+          '<span class="name">'+escapeHtml(z.name)+' <span class="mono" style="font-size:10px;color:var(--ink-dim);">· '+(z.kind==="demimur"?"Demi-mur":"Mur")+'</span></span>' +
           '<button class="remove-chip zone-del" data-id="'+z.id+'">✕</button>' +
         '</div>';
       }
@@ -1771,6 +1821,7 @@
           state._draftZones = entry.zones.map(function(z){
             if(z.kind === "point") return { id: genId("pt"), kind:"point", name:z.name, latlng:z.latlng, icon:z.icon, color:z.color };
             if(z.kind === "terrain") return { id: genId("t"), kind:"terrain", name: z.name||"Limite du terrain", points: z.points };
+            if(z.kind === "mur" || z.kind === "demimur") return { id: genId("w"), kind: z.kind, name: z.name, points: z.points };
             return { id: genId("z"), kind:"building", name: z.name, points: z.points, status:"intact" };
           });
           teardownLibraryMap();
@@ -1949,6 +2000,30 @@
     };
   }
 
+  // ---------- Écran Journal (SOS pour l'instant) ----------
+  function renderLog(){
+    app.innerHTML =
+      '<div class="topbar"><button class="back">‹ Retour</button><div class="eyebrow">Journal — SOS</div></div>' +
+      '<div id="log-list"></div>';
+    document.querySelector(".back").onclick = function(){ state.screen="map"; render(); };
+    loadLog();
+  }
+
+  async function loadLog(){
+    var el = document.getElementById("log-list");
+    if(!el || !state.event) return;
+    el.innerHTML = '<p class="mono" style="font-size:11px;color:var(--ink-dim);">Chargement…</p>';
+    var log = await loadEventLog(state.event.code);
+    var entries = log.filter(function(e){ return e.type === "sos" || e.type === "sos_resolved"; }).slice().reverse();
+    if(!entries.length){ el.innerHTML = '<p>Aucun événement SOS pour l\u2019instant.</p>'; return; }
+    el.innerHTML = entries.map(function(e){
+      var d = new Date(e.ts);
+      var hh = ("0"+d.getHours()).slice(-2), mm = ("0"+d.getMinutes()).slice(-2);
+      var label = e.type === "sos" ? ("🆘 SOS déclenché par "+escapeHtml(e.name)) : ("✓ SOS résolu par "+escapeHtml(e.name));
+      return '<div class="zone-row"><span class="name">'+label+'</span><span class="mono" style="font-size:10px;color:var(--ink-dim);">'+hh+':'+mm+'</span></div>';
+    }).join("");
+  }
+
   function renderMap(){
     var cfg = state.event;
     app.innerHTML =
@@ -2015,6 +2090,7 @@
       btn.textContent = state.player.sos ? "🆘 Annuler la demande d\u2019aide" : "🆘 Demander de l\u2019aide";
       if(state.event && state.player.name){
         await upsertPlayer(state.event.code, state.playerId, { sos: state.player.sos });
+        await appendEventLog(state.event.code, { ts: Date.now(), type: state.player.sos ? "sos" : "sos_resolved", name: state.player.name });
       }
     };
 
@@ -2234,7 +2310,8 @@
     el.innerHTML =
       '<button class="btn btn-ghost btn-sm" id="btn-edit-buildings-live">Éditer la carte</button>' +
       '<button class="btn btn-ghost btn-sm" id="btn-roles-live">Rôles & visibilité</button>' +
-      '<button class="btn btn-ghost btn-sm" id="btn-code-live">Code / QR</button>';
+      '<button class="btn btn-ghost btn-sm" id="btn-code-live">Code / QR</button>' +
+      '<button class="btn btn-ghost btn-sm" id="btn-log-live">📋 Journal SOS</button>';
     document.getElementById("btn-edit-buildings-live").onclick = async function(){
       var code = state.event.code;
       state.editorMode = "live";
@@ -2255,6 +2332,11 @@
       state.screen = "reveal";
       render();
     };
+    document.getElementById("btn-log-live").onclick = function(){
+      teardownMap();
+      state.screen = "log";
+      render();
+    };
   }
 
   function updateStaffUI(amStaff){
@@ -2268,6 +2350,7 @@
       '<div class="row" style="margin-top:8px;">' +
         '<button class="btn btn-ghost btn-sm" id="btn-edit-buildings-staff">Éditer la carte</button>' +
         '<button class="btn btn-ghost btn-sm" id="btn-code-staff">Code / QR</button>' +
+        '<button class="btn btn-ghost btn-sm" id="btn-log-staff">📋 Journal SOS</button>' +
       '</div>';
     document.getElementById("staff-visible-toggle").onchange = async function(e){
       state.player.staffHidden = !e.target.checked;
@@ -2286,6 +2369,11 @@
       teardownMap();
       state.revealFromMap = true;
       state.screen = "reveal";
+      render();
+    };
+    document.getElementById("btn-log-staff").onclick = function(){
+      teardownMap();
+      state.screen = "log";
       render();
     };
   }
@@ -2402,6 +2490,31 @@
     return inside;
   }
 
+  // Distance (mètres) et direction cardinale entre deux points GPS — utilisé pour le petit
+  // repère "120 m, Nord-Est" affiché au tap sur un coéquipier ou un point.
+  function distanceMeters(lat1, lng1, lat2, lng2){
+    var R = 6371000;
+    var toRad = function(d){ return d * Math.PI / 180; };
+    var dLat = toRad(lat2-lat1), dLng = toRad(lng2-lng1);
+    var a = Math.sin(dLat/2)*Math.sin(dLat/2) + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLng/2)*Math.sin(dLng/2);
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  }
+  function bearingCardinal(lat1, lng1, lat2, lng2){
+    var toRad = function(d){ return d * Math.PI / 180; };
+    var y = Math.sin(toRad(lng2-lng1)) * Math.cos(toRad(lat2));
+    var x = Math.cos(toRad(lat1))*Math.sin(toRad(lat2)) - Math.sin(toRad(lat1))*Math.cos(toRad(lat2))*Math.cos(toRad(lng2-lng1));
+    var deg = (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+    var dirs = ["Nord","Nord-Est","Est","Sud-Est","Sud","Sud-Ouest","Ouest","Nord-Ouest"];
+    return dirs[Math.round(deg / 45) % 8];
+  }
+  function distanceLabel(lat, lng){
+    if(!state.lastCoords) return null;
+    var d = distanceMeters(state.lastCoords.lat, state.lastCoords.lng, lat, lng);
+    var dir = bearingCardinal(state.lastCoords.lat, state.lastCoords.lng, lat, lng);
+    var distTxt = d < 1000 ? (Math.round(d)+" m") : ((d/1000).toFixed(1)+" km");
+    return distTxt + ", " + dir;
+  }
+
   // Purement informatif — jamais une règle stricte (élimination automatique, etc.) : le
   // GPS d'un téléphone est précis à quelques mètres près, pas assez pour trancher seul.
   // Ça sert juste à fluidifier le jeu, pas à remplacer l'observation sur le terrain.
@@ -2422,6 +2535,7 @@
   function isValidZone(z){
     if(!z || !z.id) return false;
     if(z.kind === "point") return Array.isArray(z.latlng) && z.latlng.length === 2;
+    if(z.kind === "mur" || z.kind === "demimur") return Array.isArray(z.points) && z.points.length >= 2;
     return Array.isArray(z.points) && z.points.length >= 3;
   }
 
@@ -2483,6 +2597,12 @@
           .bindTooltip('<span class="player-label-inner">'+escapeHtml(p.name||"?")+'</span>', { permanent: true, direction: 'top', offset: [0,-15], className: 'player-label' });
         marker._lastName = p.name;
         marker._lastBadge = badgeGlyph;
+        marker.on('click', function(){
+          if(pid === state.playerId) return;
+          var pos = marker.getLatLng();
+          var label = distanceLabel(pos.lat, pos.lng);
+          if(label) marker.bindPopup(label).openPopup();
+        });
         state.markers[pid] = marker;
       }
     });
