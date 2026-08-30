@@ -424,6 +424,7 @@
     cachedPings: [],
     fogUntil: null,
     radarBonusUntil: null,
+    _skipHistoryPush: false,
     pendingLibraryHighlight: null,
     warzoneTickTimer: null,
     _draftZones: []
@@ -805,8 +806,20 @@
   }
 
   // ---------- Rendu ----------
+  var _lastPushedScreen = null;
   function render(){
     stopMapIfNeeded();
+    // Synchronise l'écran courant avec l'historique du navigateur : sans ça, le bouton
+    // "retour" du téléphone ne voit qu'une seule page du début à la fin de l'appli, et
+    // saute direct au tout début (ou ferme l'appli) au lieu de revenir écran par écran.
+    if(state.screen !== _lastPushedScreen){
+      if(state._skipHistoryPush){
+        state._skipHistoryPush = false;
+      } else {
+        history.pushState({ screen: state.screen }, "", "");
+      }
+      _lastPushedScreen = state.screen;
+    }
     if(state.screen === "home") return renderHome();
     if(state.screen === "create") return renderCreate();
     if(state.screen === "join") return renderJoin();
@@ -819,8 +832,18 @@
     if(state.screen === "moderation") return renderModeration();
     if(state.screen === "intro") return renderIntro();
     if(state.screen === "log") return renderLog();
-    if(state.screen === "log") return renderLog();
   }
+
+  // Bouton/geste "retour" du téléphone : on revient à l'écran précédemment visité dans
+  // l'appli, sans repousser une nouvelle entrée (on vient justement d'en dépiler une).
+  window.addEventListener("popstate", function(e){
+    if(e.state && e.state.screen){
+      state.screen = e.state.screen;
+      _lastPushedScreen = state.screen;
+      state._skipHistoryPush = true;
+      render();
+    }
+  });
 
   function stopMapIfNeeded(){
     if(state.screen !== "map" && state.pollTimer){ clearInterval(state.pollTimer); state.pollTimer = null; }
@@ -1082,7 +1105,7 @@
       }
       state.revealFromMap = false;
       state.screen = "reveal";
-      renderReveal();
+      render();
     };
   }
 
