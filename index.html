@@ -167,6 +167,7 @@
     display:flex; flex-direction:column; gap:6px; pointer-events:none;
   }
   .map-rotate-wrapper.fullscreen .warzone-banner-overlay{ top:calc(env(safe-area-inset-top, 0px) + 10px); right:calc(env(safe-area-inset-right, 0px) + 54px); left:calc(env(safe-area-inset-left, 0px) + 8px); }
+  .mini-banner{ padding:5px 10px; border-radius:var(--radius); background:rgba(20,23,15,0.82); border:1px solid var(--line); pointer-events:auto; width:fit-content; }
   .status-bar{ display:flex; align-items:center; gap:8px; margin:10px 0; font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--ink-dim); letter-spacing:.05em; text-transform:uppercase; }
   .compass-row{ display:flex; align-items:center; gap:14px; margin-top:12px; }
   .compass-dial{
@@ -422,6 +423,12 @@
     refImageRotation: 0,
     refImageOpacity: 0.6,
     refImagePlacing: false,
+    flagCreationMode: null,
+    warzoneCreationMode: null,
+    trails: {},
+    trailLayers: {},
+    trailDuration: 0,
+    trailScope: null,
     refImageOverlayEl: null,
     cachedZones: [],
     modAuthed: false,
@@ -631,6 +638,15 @@
     { kind:"bombe",    emoji:"\ud83d\udca3", label:"Bombe trouv\u00e9e/pos\u00e9e" }
   ];
   function eventPingsKey(code){ return "event:" + code + ":pings"; }
+  function eventScoreKey(code){ return "event:" + code + ":score"; }
+  async function loadScore(code){
+    var raw = await storageGet(eventScoreKey(code));
+    if(!raw) return {};
+    try{ return JSON.parse(raw); }catch(e){ return {}; }
+  }
+  async function saveScore(code, score){
+    return storageSet(eventScoreKey(code), JSON.stringify(score));
+  }
   async function loadPings(code){
     var raw = await storageGet(eventPingsKey(code));
     if(!raw) return [];
@@ -880,6 +896,7 @@
     if(state.screen === "moderation") return renderModeration();
     if(state.screen === "intro") return renderIntro();
     if(state.screen === "log") return renderLog();
+    if(state.screen === "gamemode") return renderGameMode();
   }
 
   // Bouton/geste "retour" du téléphone : on revient à l'écran précédemment visité dans
@@ -1136,7 +1153,10 @@
         teams: state._draftTeams,
         center: state._draftCenter,
         zoom: 17,
-        createdAt: Date.now()
+        createdAt: Date.now(),
+        captureBaseMinutes: 10,
+        scorePointsPerInterval: 1,
+        scoreIntervalSeconds: 30
       };
       var ok = await saveEventConfig(cfg);
       if(!ok){ state.lastEventErr = "Impossible de créer l'événement pour l'instant. Réessaie."; render(); return; }
@@ -1329,6 +1349,8 @@
 
     function proceedToMap(){
       if(state.player.team === "Staff"){ state.player._grantStaffOnJoin = true; }
+      state.player.livesRemaining = undefined;
+      state.player._wasInSpawn = false;
       state.screen = "map";
       render();
     }
@@ -1380,6 +1402,7 @@
       '<p style="margin-top:4px;">Touche un bâtiment, une limite ou un point sur la carte pour faire apparaître ses poignées et le modifier. Touche-le à nouveau pour les cacher.</p>' +
       '<div class="editor-toolbar" id="editor-toolbar"></div>' +
       '<div class="zone-list" id="zone-list"></div>' +
+      '<div id="capture-settings-panel"></div>' +
       '<div class="row" style="margin-top:12px;">' +
         '<button class="btn btn-sm btn-ghost" id="btn-load-map">Charger une carte</button>' +
         '<button class="btn btn-sm btn-ghost" id="btn-save-map">Enregistrer comme modèle</button>' +
@@ -1413,10 +1436,30 @@
     drawExistingZones();
     drawToolbar();
     drawZoneList();
+    renderCaptureSettingsPanel();
     renderRefImageControls();
     map.on('move zoom', updateRefImageOverlayPosition);
 
     map.on('click', function(e){
+      if(state.flagCreationMode === "building"){
+        var hit = state.editorZones.find(function(z){ return z.kind === "building" && pointInPolygon(e.latlng.lat, e.latlng.lng, z.points); });
+        var errEl = document.getElementById("flag-choice-error");
+        if(!hit){ if(errEl) errEl.textContent = "Aucun bâtiment à cet endroit — touche l\u2019intérieur d\u2019un bâtiment déjà tracé."; return; }
+        state.flagCreationMode = null;
+        promptFlagName(hit.points.slice());
+        return;
+      }
+      if(state.flagCreationMode === "circle"){
+        var radiusInput = document.getElementById("flag-radius");
+        var radius = Math.max(1, parseFloat(radiusInput && radiusInput.value) || 15);
+        state.flagCreationMode = null;
+        promptFlagName(circlePolygonPoints(e.latlng.lat, e.latlng.lng, radius, 28));
+        return;
+      }
+      if(state.warzoneCreationMode === "gas"){
+        confirmGasZone([e.latlng.lat, e.latlng.lng]);
+        return;
+      }
       if(state.refImagePlacing){
         handleRefImageCornerTap([e.latlng.lat, e.latlng.lng]);
         return;
@@ -1613,6 +1656,23 @@
     return { color:'#b3402f', weight:2, dashArray:null, fillOpacity:0.35, active:true, label: "ZONE INTERDITE" };
   }
 
+  // ---------- Gaz évolutif (zone sûre qui rétrécit par paliers, façon Battle Royale) ----------
+  // Purement calculé à partir du temps écoulé depuis "startAt" — jamais besoin d'écrire quoi
+  // que ce soit pendant le rétrécissement, chaque téléphone calcule le même résultat seul.
+  function gasCurrentState(z){
+    var now = Date.now();
+    var phaseMs = Math.max(1, z.phaseMinutes||5) * 60000;
+    var elapsed = Math.max(0, now - (z.startAt||now));
+    if(z.frozenRadius !== null && z.frozenRadius !== undefined){
+      return { radius: z.frozenRadius, nextShrinkMs: null, phase: Math.floor(elapsed/phaseMs) };
+    }
+    var phasesElapsed = Math.floor(elapsed / phaseMs);
+    var radius = Math.max(z.minRadius||5, (z.initialRadius||50) - phasesElapsed * (z.shrinkAmount||10));
+    var msIntoPhase = elapsed % phaseMs;
+    var nextShrinkMs = (radius > (z.minRadius||5)) ? (phaseMs - msIntoPhase) : null;
+    return { radius: radius, nextShrinkMs: nextShrinkMs, phase: phasesElapsed };
+  }
+
   function addZoneLayer(map, z){
     var layer;
     if(z.kind === "point"){
@@ -1641,6 +1701,12 @@
       layer = L.polygon(z.points, {
         color: ownerColor, weight:2.5, fillColor: ownerColor, fillOpacity: z.captureOwner ? 0.3 : 0.12
       }).addTo(map).bindTooltip(flagLabel);
+    } else if(z.kind === "gaz"){
+      var gs = gasCurrentState(z);
+      var pts = circlePolygonPoints(z.center.lat, z.center.lng, gs.radius, 40);
+      var gasLabel = escapeHtml(z.name) + ' · zone sûre ' + Math.round(gs.radius) + ' m';
+      layer = L.polygon(pts, { color:'#3ca55c', weight:2.5, fillColor:'#3ca55c', fillOpacity:0.06 })
+        .addTo(map).bindTooltip(gasLabel);
     } else {
       var info = zoneStatusInfo(z.status);
       layer = L.polygon(z.points, {
@@ -1675,6 +1741,25 @@
         await persistEditorZones();
       });
       return [marker];
+    }
+
+    if(z.kind === "gaz"){
+      var gs = gasCurrentState(z);
+      var pts = circlePolygonPoints(z.center.lat, z.center.lng, gs.radius, 40);
+      var poly2 = L.polygon(pts, { color:'#3ca55c', weight:2.5, fillColor:'#3ca55c', fillOpacity:0.06 })
+        .addTo(map).bindTooltip(escapeHtml(z.name) + ' · zone sûre ' + Math.round(gs.radius) + ' m (calculé automatiquement, pas de sommets à déplacer)');
+      poly2.on('click', function(){
+        state.editingZoneId = isEditingThis ? null : z.id;
+        drawExistingZones();
+      });
+      var centerMarker = L.marker([z.center.lat, z.center.lng], { icon: vertexHandleIcon(), draggable: isEditingThis }).addTo(map);
+      centerMarker.on('dragend', async function(e){
+        var ll = e.target.getLatLng();
+        z.center = { lat: ll.lat, lng: ll.lng };
+        await persistEditorZones();
+        drawExistingZones();
+      });
+      return [poly2, centerMarker];
     }
 
     var isTerrain = z.kind === "terrain";
@@ -1714,10 +1799,10 @@
   }
 
   function orderedZones(zones){
-    // la limite de terrain d'abord (dessous), puis les zones de guerre, puis les bâtiments et
-    // drapeaux, puis les murs, puis les points (dessus)
+    // la limite de terrain d'abord (dessous), puis les zones de guerre et le gaz, puis les
+    // bâtiments et drapeaux, puis les murs, puis les points (dessus)
     return zones.filter(function(z){ return z.kind === "terrain"; })
-      .concat(zones.filter(function(z){ return z.kind === "guerre"; }))
+      .concat(zones.filter(function(z){ return z.kind === "guerre" || z.kind === "gaz"; }))
       .concat(zones.filter(function(z){ return z.kind === "building" || z.kind === "drapeau" || !z.kind; }))
       .concat(zones.filter(function(z){ return z.kind === "mur" || z.kind === "demimur"; }))
       .concat(zones.filter(function(z){ return z.kind === "point"; }));
@@ -1807,7 +1892,7 @@
           '<button class="btn btn-sm btn-ghost" id="btn-start-halfwall">⬜ Demi-mur</button>' +
         '</div>' +
         '<div class="row" style="margin-top:6px;">' +
-          '<button class="btn btn-sm btn-ghost" id="btn-start-warzone">☠ Zone de guerre</button>' +
+          '<button class="btn btn-sm btn-ghost" id="btn-start-warzone">☢️ Warzone</button>' +
           '<button class="btn btn-sm btn-ghost" id="btn-start-flag">🚩 Drapeau</button>' +
         '</div>';
       document.getElementById("btn-start-terrain").onclick = function(){ state.editingZoneId = null; state.drawing = true; state.drawKind = "terrain"; state.drawPoints = []; drawExistingZones(); drawToolbar(); };
@@ -1815,14 +1900,14 @@
       document.getElementById("btn-start-point").onclick = function(){ state.editingZoneId = null; state.placingPoint = true; drawExistingZones(); drawToolbar(); };
       document.getElementById("btn-start-wall").onclick = function(){ state.editingZoneId = null; state.drawing = true; state.drawKind = "mur"; state.drawPoints = []; drawExistingZones(); drawToolbar(); };
       document.getElementById("btn-start-halfwall").onclick = function(){ state.editingZoneId = null; state.drawing = true; state.drawKind = "demimur"; state.drawPoints = []; drawExistingZones(); drawToolbar(); };
-      document.getElementById("btn-start-warzone").onclick = function(){ state.editingZoneId = null; state.drawing = true; state.drawKind = "guerre"; state.drawPoints = []; drawExistingZones(); drawToolbar(); };
-      document.getElementById("btn-start-flag").onclick = function(){ state.editingZoneId = null; state.drawing = true; state.drawKind = "drapeau"; state.drawPoints = []; drawExistingZones(); drawToolbar(); };
+      document.getElementById("btn-start-warzone").onclick = function(){ state.editingZoneId = null; showWarzoneCreationChoice(); };
+      document.getElementById("btn-start-flag").onclick = function(){ state.editingZoneId = null; showFlagCreationChoice(); };
       return;
     }
 
     var isWallKind = state.drawKind === "mur" || state.drawKind === "demimur";
     var minPts = isWallKind ? 2 : 3;
-    var label = state.drawKind === "terrain" ? "coin de la limite du terrain" : (state.drawKind === "guerre" ? "coin de la zone de guerre" : (state.drawKind === "drapeau" ? "coin de la zone drapeau" : (isWallKind ? "point du tracé" : "coin du bâtiment")));
+    var label = state.drawKind === "terrain" ? "coin de la limite du terrain" : (state.drawKind === "guerre" ? "coin de la Warzone" : (state.drawKind === "drapeau" ? "coin de la zone drapeau" : (isWallKind ? "point du tracé" : "coin du bâtiment")));
     el.innerHTML =
       '<span class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">Points placés : '+state.drawPoints.length+' (min. '+minPts+')</span>' +
       '<div class="row" style="margin-top:6px;">' +
@@ -1848,6 +1933,152 @@
     };
   }
 
+  // ---------- Réglages de capture/score (visibles en direct, l'organisateur décide) ----------
+  function renderCaptureSettingsPanel(){
+    var el = document.getElementById("capture-settings-panel");
+    if(!el) return;
+    if(state.editorMode !== "live" || !state.event){ el.innerHTML = ""; return; }
+    var cfg = state.event;
+    el.innerHTML =
+      '<div class="panel" style="margin-top:14px;">' +
+        '<label class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">🚩 Réglages capture &amp; score</label>' +
+        '<div class="field" style="margin-top:6px;"><label>Temps de capture de base, seul (minutes)</label>' +
+          '<input type="number" id="cap-base-minutes" value="'+(cfg.captureBaseMinutes||10)+'" min="1" /></div>' +
+        '<div class="field"><label>Points par joueur, toutes les X secondes</label>' +
+          '<input type="number" id="cap-score-interval" value="'+(cfg.scoreIntervalSeconds||30)+'" min="1" /></div>' +
+        '<div class="field"><label>Points par joueur par intervalle</label>' +
+          '<input type="number" id="cap-score-points" value="'+(typeof cfg.scorePointsPerInterval==="number"?cfg.scorePointsPerInterval:1)+'" min="0" step="0.5" /></div>' +
+        '<p style="margin-top:4px;font-size:11px;color:var(--ink-dim);">+10% de vitesse de capture par joueur en renfort, plafonné à +100% (10 joueurs).</p>' +
+        '<button class="btn btn-sm btn-primary" id="btn-save-capture-settings" style="margin-top:6px;">Enregistrer</button>' +
+        '<div id="capture-settings-banner"></div>' +
+      '</div>';
+    document.getElementById("btn-save-capture-settings").onclick = async function(){
+      var minutes = Math.max(1, parseFloat(document.getElementById("cap-base-minutes").value) || 10);
+      var interval = Math.max(1, parseFloat(document.getElementById("cap-score-interval").value) || 30);
+      var points = Math.max(0, parseFloat(document.getElementById("cap-score-points").value) || 0);
+      state.event.captureBaseMinutes = minutes;
+      state.event.scoreIntervalSeconds = interval;
+      state.event.scorePointsPerInterval = points;
+      var ok = await saveEventConfig(state.event);
+      var banner = document.getElementById("capture-settings-banner");
+      if(banner) banner.innerHTML = ok ? '<div class="banner info">Réglages enregistrés.</div>' : '<div class="banner warn">Échec de l\u2019enregistrement.</div>';
+    };
+  }
+
+  // ---------- Création d'un drapeau : trois façons de définir son périmètre ----------
+  // ---------- Création d'une Warzone : zone fixe (existant) ou gaz évolutif (nouveau) ----------
+  function showWarzoneCreationChoice(){
+    state.drawing = false; state.drawPoints = []; state.drawKind = null; state.placingPoint = false;
+    updateDrawPreview();
+    var el = document.getElementById("editor-toolbar");
+    el.innerHTML =
+      '<p class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">Quel type de Warzone ?</p>' +
+      '<div class="row" style="margin-top:6px;">' +
+        '<button class="btn btn-sm btn-ghost" id="btn-wz-fixed">◼ Zone fixe</button>' +
+        '<button class="btn btn-sm btn-ghost" id="btn-wz-gas">☣️ Gaz évolutif</button>' +
+      '</div>' +
+      '<p style="margin-top:6px;font-size:11px;color:var(--ink-dim);">Zone fixe : ferme d\u2019un coup après un compte à rebours, comme avant. Gaz évolutif : la zone sûre rétrécit par paliers, façon Battle Royale.</p>' +
+      '<button class="btn btn-sm btn-ghost" id="btn-wz-cancel" style="margin-top:6px;">Annuler</button>';
+    document.getElementById("btn-wz-fixed").onclick = function(){
+      state.drawing = true; state.drawKind = "guerre"; state.drawPoints = [];
+      drawExistingZones(); drawToolbar();
+    };
+    document.getElementById("btn-wz-gas").onclick = function(){
+      el.innerHTML =
+        '<div class="field" style="margin-top:0;"><label>Rayon de départ (mètres)</label><input type="number" id="gas-initial" value="80" min="1" /></div>' +
+        '<div class="field"><label>Rétrécit de (mètres) toutes les</label><input type="number" id="gas-shrink" value="10" min="1" /></div>' +
+        '<div class="field"><label>Minutes par palier</label><input type="number" id="gas-minutes" value="5" min="1" /></div>' +
+        '<div class="field"><label>Rayon minimum (mètres)</label><input type="number" id="gas-min" value="5" min="1" /></div>' +
+        '<p style="margin-top:6px;">Touche le centre du gaz sur la carte.</p>' +
+        '<button class="btn btn-sm btn-ghost" id="btn-wz-gas-cancel">Annuler</button>';
+      state.warzoneCreationMode = "gas";
+      document.getElementById("btn-wz-gas-cancel").onclick = function(){ state.warzoneCreationMode = null; drawToolbar(); };
+    };
+    document.getElementById("btn-wz-cancel").onclick = function(){ drawToolbar(); };
+  }
+
+  async function confirmGasZone(centerLatLng){
+    var initial = Math.max(1, parseFloat(document.getElementById("gas-initial").value) || 80);
+    var shrink = Math.max(1, parseFloat(document.getElementById("gas-shrink").value) || 10);
+    var minutes = Math.max(1, parseFloat(document.getElementById("gas-minutes").value) || 5);
+    var minR = Math.max(1, parseFloat(document.getElementById("gas-min").value) || 5);
+    state.warzoneCreationMode = null;
+    state.editorZones.push({
+      id: genId("gas"), kind: "gaz", name: "Gaz",
+      center: { lat: centerLatLng[0], lng: centerLatLng[1] },
+      initialRadius: initial, shrinkAmount: shrink, phaseMinutes: minutes, minRadius: minR,
+      startAt: Date.now(), frozenRadius: null
+    });
+    drawExistingZones();
+    drawToolbar();
+    drawZoneList();
+    await persistEditorZones();
+  }
+
+  function showFlagCreationChoice(){
+    state.drawing = false; state.drawPoints = []; state.drawKind = null; state.placingPoint = false;
+    state.flagCreationMode = null;
+    updateDrawPreview();
+    var el = document.getElementById("editor-toolbar");
+    el.innerHTML =
+      '<p class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">Comment définir la zone du drapeau ?</p>' +
+      '<div class="row" style="margin-top:6px;">' +
+        '<button class="btn btn-sm btn-ghost" id="btn-flag-building">🏠 Bâtiment existant</button>' +
+        '<button class="btn btn-sm btn-ghost" id="btn-flag-circle">⭕ Cercle (rayon)</button>' +
+      '</div>' +
+      '<div class="row" style="margin-top:6px;">' +
+        '<button class="btn btn-sm btn-ghost" id="btn-flag-freehand">✏️ Tracé libre</button>' +
+        '<button class="btn btn-sm btn-ghost" id="btn-flag-cancel">Annuler</button>' +
+      '</div>';
+    document.getElementById("btn-flag-building").onclick = function(){
+      state.flagCreationMode = "building";
+      el.innerHTML = '<p>Touche l\u2019intérieur d\u2019un bâtiment déjà tracé sur la carte.</p><p id="flag-choice-error" style="color:var(--danger);font-size:12px;"></p>' +
+        '<button class="btn btn-sm btn-ghost" id="btn-flag-cancel2">Annuler</button>';
+      document.getElementById("btn-flag-cancel2").onclick = function(){ state.flagCreationMode = null; drawToolbar(); };
+    };
+    document.getElementById("btn-flag-circle").onclick = function(){
+      el.innerHTML =
+        '<div class="field" style="margin-top:0;"><label>Rayon (mètres)</label><input type="number" id="flag-radius" value="15" min="1" /></div>' +
+        '<p style="margin-top:6px;">Touche le centre du cercle sur la carte.</p>' +
+        '<button class="btn btn-sm btn-ghost" id="btn-flag-cancel3">Annuler</button>';
+      state.flagCreationMode = "circle";
+      document.getElementById("btn-flag-cancel3").onclick = function(){ state.flagCreationMode = null; drawToolbar(); };
+    };
+    document.getElementById("btn-flag-freehand").onclick = function(){
+      state.flagCreationMode = null;
+      state.drawing = true; state.drawKind = "drapeau"; state.drawPoints = [];
+      drawExistingZones(); drawToolbar();
+    };
+    document.getElementById("btn-flag-cancel").onclick = function(){
+      state.flagCreationMode = null;
+      drawToolbar();
+    };
+  }
+
+  function promptFlagName(points){
+    var el = document.getElementById("editor-toolbar");
+    el.innerHTML =
+      '<div class="field" style="margin-top:0;"><label>Nom du drapeau (optionnel)</label><input type="text" id="zone-name" placeholder="Ex. Point Alpha" /></div>' +
+      '<div class="row" style="margin-top:8px;">' +
+        '<button class="btn btn-sm btn-primary" id="btn-confirm-flag">Ajouter</button>' +
+        '<button class="btn btn-sm btn-ghost" id="btn-cancel-flag">Annuler</button>' +
+      '</div>';
+    var nameInput = document.getElementById("zone-name");
+    if(nameInput) nameInput.focus();
+    document.getElementById("btn-cancel-flag").onclick = function(){ drawToolbar(); };
+    document.getElementById("btn-confirm-flag").onclick = async function(){
+      var name = nameInput && nameInput.value.trim() ? nameInput.value.trim() : "Drapeau";
+      state.editorZones.push({
+        id: genId("f"), kind: "drapeau", name: name, points: points,
+        captureOwner: null, captureTarget: null, captureProgress: 0, captureLastTick: null
+      });
+      drawExistingZones();
+      drawToolbar();
+      drawZoneList();
+      await persistEditorZones();
+    };
+  }
+
   function finishDrawing(){
     var isWallKind = state.drawKind === "mur" || state.drawKind === "demimur";
     var minPts = isWallKind ? 2 : 3;
@@ -1856,7 +2087,7 @@
     var isWarzone = state.drawKind === "guerre";
     var isFlag = state.drawKind === "drapeau";
     var el = document.getElementById("editor-toolbar");
-    var nameLabel = isWarzone ? "de la zone" : (isFlag ? "du drapeau" : (isWallKind ? (state.drawKind==="demimur"?"du demi-mur":"du mur") : "du bâtiment"));
+    var nameLabel = isWarzone ? "de la Warzone" : (isFlag ? "du drapeau" : (isWallKind ? (state.drawKind==="demimur"?"du demi-mur":"du mur") : "du bâtiment"));
     var namePlaceholder = isWarzone ? "Ex. Secteur Nord" : (isFlag ? "Ex. Point Alpha" : (isWallKind ? "Ex. Mur Est" : "Ex. Hangar Nord"));
     el.innerHTML =
       (isTerrain ? '' : '<div class="field" style="margin-top:0;"><label>Nom '+nameLabel+' (optionnel)</label><input type="text" id="zone-name" placeholder="'+namePlaceholder+'" /></div>') +
@@ -1877,7 +2108,7 @@
         state.editorZones = state.editorZones.filter(function(z){ return z.kind !== "terrain"; });
         state.editorZones.unshift({ id: genId("t"), kind: "terrain", name: "Limite du terrain", points: state.drawPoints.slice() });
       } else if(isWarzone){
-        var name2 = nameInput && nameInput.value.trim() ? nameInput.value.trim() : "Zone de guerre";
+        var name2 = nameInput && nameInput.value.trim() ? nameInput.value.trim() : "Warzone";
         var minutesInput = document.getElementById("zone-minutes");
         var minutes = Math.max(1, parseInt(minutesInput && minutesInput.value, 10) || 5);
         state.editorZones.push({ id: genId("w"), kind: "guerre", name: name2, points: state.drawPoints.slice(), deactivateAt: Date.now() + minutes*60000 });
@@ -1991,6 +2222,18 @@
           '<button class="remove-chip zone-del" data-id="'+z.id+'">✕</button>' +
         '</div>';
       }
+      if(z.kind === "gaz"){
+        var gs2 = gasCurrentState(z);
+        var statusTxt2 = z.frozenRadius !== null && z.frozenRadius !== undefined
+          ? ('figé à '+Math.round(gs2.radius)+' m')
+          : (gs2.nextShrinkMs !== null ? ('rayon '+Math.round(gs2.radius)+' m · prochain palier dans '+Math.ceil(gs2.nextShrinkMs/60000)+' min') : ('rayon minimum atteint ('+Math.round(gs2.radius)+' m)'));
+        return '<div class="zone-row">' +
+          '<span style="font-size:14px;">☣️</span>' +
+          '<span class="name">'+escapeHtml(z.name)+' <span class="mono" style="font-size:10px;color:var(--ink-dim);">· '+statusTxt2+'</span></span>' +
+          (z.frozenRadius === null || z.frozenRadius === undefined ? '<button class="btn btn-sm btn-ghost gas-freeze" data-id="'+z.id+'" style="padding:6px 10px;">Figer maintenant</button>' : '') +
+          '<button class="remove-chip zone-del" data-id="'+z.id+'">✕</button>' +
+        '</div>';
+      }
       if(z.kind === "mur" || z.kind === "demimur"){
         return '<div class="zone-row">' +
           '<span style="font-size:14px;">'+(z.kind==="demimur"?"⬜":"🧱")+'</span>' +
@@ -2038,6 +2281,12 @@
       btn.onclick = async function(){
         var z = state.editorZones.find(function(z){ return z.id === btn.dataset.id; });
         if(z){ z.deactivateAt = Date.now(); drawExistingZones(); drawZoneList(); await persistEditorZones(); }
+      };
+    });
+    Array.prototype.forEach.call(wrap.querySelectorAll(".gas-freeze"), function(btn){
+      btn.onclick = async function(){
+        var z = state.editorZones.find(function(z){ return z.id === btn.dataset.id; });
+        if(z){ z.frozenRadius = gasCurrentState(z).radius; drawExistingZones(); drawZoneList(); await persistEditorZones(); }
       };
     });
     Array.prototype.forEach.call(wrap.querySelectorAll(".flag-assign"), function(btn){
@@ -2127,7 +2376,7 @@
     document.getElementById("btn-confirm-save-map").onclick = async function(){
       var name = input.value.trim();
       if(!name) return;
-      var tpl = { id: genId("map"), name: name, center: state.editorCenter || null, zones: state.editorZones.filter(function(z){ return z.kind !== "guerre"; }).map(function(z){
+      var tpl = { id: genId("map"), name: name, center: state.editorCenter || null, zones: state.editorZones.filter(function(z){ return z.kind !== "guerre" && z.kind !== "gaz"; }).map(function(z){
         if(z.kind === "point"){ return { kind:"point", name:z.name, latlng:z.latlng, icon:z.icon, color:z.color }; }
         return { kind: z.kind || "building", name: z.name, points: z.points };
       }) };
@@ -2151,6 +2400,8 @@
     state.refImageCorners = null;
     state.refImageRotation = 0;
     state.refImagePlacing = false;
+    state.flagCreationMode = null;
+    state.warzoneCreationMode = null;
   }
 
   // ---------- Écran Rôles & visibilité (organisateur) ----------
@@ -2760,11 +3011,248 @@
     }).join("");
   }
 
+  // ---------- Écran Mode de jeu (organisateur) ----------
+  function renderGameMode(){
+    app.innerHTML =
+      '<div class="topbar"><button class="back">‹ Retour</button><div class="eyebrow">🕹 Mode de jeu</div></div>' +
+      '<p style="margin-top:4px;">Les mécaniques disponibles pour cette partie. Certaines se configurent directement ici, d\u2019autres depuis l\u2019éditeur de carte ou Rôles &amp; visibilité.</p>' +
+      '<div id="gamemode-list" style="margin-top:10px;"></div>';
+    document.querySelector(".back").onclick = function(){ state.screen="map"; render(); };
+    loadGameModeSummary();
+  }
+
+  async function loadGameModeSummary(){
+    var el = document.getElementById("gamemode-list");
+    if(!el || !state.event) return;
+    el.innerHTML = '<p class="mono" style="font-size:11px;color:var(--ink-dim);">Chargement…</p>';
+    var code = state.event.code;
+    var zones = await loadZones(code);
+    var players = await loadPlayers(code);
+    var flagCount = zones.filter(function(z){ return z.kind === "drapeau"; }).length;
+    var warzoneCount = zones.filter(function(z){ return z.kind === "guerre"; }).length;
+    var infectedCount = Object.keys(players).filter(function(pid){ return players[pid].infected; }).length;
+
+    var spawnCount = zones.filter(function(z){ return (z.kind === "building" || !z.kind) && z.status === "spawn"; }).length;
+    var dmEnabled = !!state.event.deathmatchEnabled;
+    var dmHtml = dmEnabled
+      ? ('<p style="font-size:12px;color:var(--ink-dim);">Activé — '+(state.event.deathmatchLives||3)+' vie(s) par joueur au départ.</p>' +
+         '<div class="row" style="margin-top:6px;">' +
+           '<button class="btn btn-sm btn-ghost" id="btn-dm-reset">Réinitialiser les vies</button>' +
+           '<button class="btn btn-sm btn-ghost" id="btn-dm-disable">Désactiver</button>' +
+         '</div>')
+      : ('<div class="field" style="margin-top:6px;"><label>Vies par joueur</label><input type="number" id="dm-lives" value="3" min="1" /></div>' +
+         (spawnCount ? '' : '<p style="font-size:11px;color:var(--amber);">Aucune zone de spawn définie — vas-y dans l\u2019éditeur pour qu\u2019un retour au spawn retire une vie.</p>') +
+         '<button class="btn btn-sm btn-primary" id="btn-dm-enable" style="margin-top:4px;">Activer</button>');
+
+    el.innerHTML =
+      '<div class="panel"><div class="zone-row"><span class="name">🚩 Capture de drapeau</span></div>' +
+        '<p style="font-size:12px;color:var(--ink-dim);">'+(flagCount ? (flagCount+' drapeau(x) sur la carte') : 'Aucun drapeau pour l\u2019instant.')+'</p>' +
+        '<button class="btn btn-sm btn-ghost" id="btn-gm-flags">Gérer dans l\u2019éditeur</button>' +
+      '</div>' +
+      '<div class="panel" style="margin-top:10px;"><div class="zone-row"><span class="name">☢️ Warzone</span></div>' +
+        '<p style="font-size:12px;color:var(--ink-dim);">'+(warzoneCount ? (warzoneCount+' Warzone(s) sur la carte') : 'Aucune Warzone pour l\u2019instant.')+'</p>' +
+        '<button class="btn btn-sm btn-ghost" id="btn-gm-warzone">Gérer dans l\u2019éditeur</button>' +
+      '</div>' +
+      '<div class="panel" style="margin-top:10px;"><div class="zone-row"><span class="name">🧟\u200d♂️ Zombie</span></div>' +
+        '<p style="font-size:12px;color:var(--ink-dim);">'+(infectedCount ? (infectedCount+' joueur(s) infecté(s)') : 'Aucun joueur infecté pour l\u2019instant.')+'</p>' +
+        '<button class="btn btn-sm btn-ghost" id="btn-gm-zombie">Gérer dans Rôles &amp; visibilité</button>' +
+      '</div>' +
+      '<div class="panel" style="margin-top:10px;"><div class="zone-row"><span class="name">☠️ Match à mort</span></div>' +
+        dmHtml +
+      '</div>' +
+      '<div class="panel" style="margin-top:10px;"><div class="zone-row"><span class="name">📂 Scénario personnalisé</span></div>' +
+        '<div id="scenario-panel"></div>' +
+      '</div>';
+
+    document.getElementById("btn-gm-flags").onclick = document.getElementById("btn-gm-warzone").onclick = async function(){
+      state.editorMode = "live";
+      state.editorZones = zones;
+      state.editorCenter = state.event.center;
+      state.screen = "editor";
+      render();
+    };
+    document.getElementById("btn-gm-zombie").onclick = function(){
+      state.screen = "roles";
+      render();
+    };
+    if(dmEnabled){
+      document.getElementById("btn-dm-reset").onclick = async function(){
+        if(!confirm("Réinitialiser les vies de tous les joueurs à "+(state.event.deathmatchLives||3)+" ?")) return;
+        var allPlayers = await loadPlayers(code);
+        var ids = Object.keys(allPlayers);
+        for(var i=0;i<ids.length;i++){ await upsertPlayer(code, ids[i], { livesRemaining: state.event.deathmatchLives||3 }); }
+        state.player.livesRemaining = state.event.deathmatchLives||3;
+        loadGameModeSummary();
+      };
+      document.getElementById("btn-dm-disable").onclick = async function(){
+        state.event.deathmatchEnabled = false;
+        await saveEventConfig(state.event);
+        loadGameModeSummary();
+      };
+    } else {
+      document.getElementById("btn-dm-enable").onclick = async function(){
+        var lives = Math.max(1, parseInt(document.getElementById("dm-lives").value, 10) || 3);
+        state.event.deathmatchEnabled = true;
+        state.event.deathmatchLives = lives;
+        await saveEventConfig(state.event);
+        loadGameModeSummary();
+      };
+    }
+    renderScenarioPanel(zones);
+  }
+
+  // ---------- Panneau de configuration du Scénario personnalisé (organisateur) ----------
+  function renderScenarioPanel(zones){
+    var el = document.getElementById("scenario-panel");
+    if(!el || !state.event) return;
+    if(!state.event.scenario) state.event.scenario = { objectives: [], triggerGas: null, triggered: false };
+    var scenario = state.event.scenario;
+    var flagZones = zones.filter(function(z){ return z.kind === "drapeau"; });
+
+    var objectivesHtml = scenario.objectives.length ? scenario.objectives.map(function(o, idx){
+      var linkedZone = o.linkedFlagId ? flagZones.find(function(z){ return z.id === o.linkedFlagId; }) : null;
+      var statusTxt = o.completed ? "✓ Terminé" :
+        (linkedZone ? ("auto — capturer" + (o.requiredTeam ? (" par " + o.requiredTeam) : "") + " « " + escapeHtml(linkedZone.name) + " »") : "manuel");
+      return '<div class="zone-row" style="flex-wrap:wrap;gap:6px;'+(o.completed?'opacity:.55;':'')+'">' +
+        '<span class="name">'+(idx+1)+'. '+escapeHtml(o.title)+' <span class="mono" style="font-size:10px;color:var(--ink-dim);">· '+statusTxt+'</span></span>' +
+        (!o.completed && !o.linkedFlagId ? '<button class="btn btn-sm btn-ghost sc-complete" data-id="'+o.id+'">Marquer terminé</button>' : '') +
+        '<button class="remove-chip sc-del" data-id="'+o.id+'">✕</button>' +
+      '</div>';
+    }).join("") : '<p style="font-size:12px;color:var(--ink-dim);">Aucun objectif pour l\u2019instant.</p>';
+
+    var teamsForObj = (state.event.teams||[]).filter(function(t){ return t.name !== "Staff"; });
+    var addFormHtml =
+      '<div class="field" style="margin-top:8px;"><label>Nouvel objectif</label><input type="text" id="sc-new-title" placeholder="Ex. Trouver la mallette" /></div>' +
+      (flagZones.length ?
+        '<div class="field"><label>Lier à un drapeau (optionnel — sinon validation manuelle par l\u2019organisateur)</label>' +
+        '<select id="sc-new-flag"><option value="">— Aucun (manuel) —</option>' +
+        flagZones.map(function(z){ return '<option value="'+z.id+'">'+escapeHtml(z.name)+'</option>'; }).join("") +
+        '</select></div>' +
+        '<div class="field"><label>Équipe requise (optionnel)</label>' +
+        '<select id="sc-new-team"><option value="">— N\u2019importe laquelle —</option>' +
+        teamsForObj.map(function(t){ return '<option value="'+escapeHtml(t.name)+'">'+escapeHtml(t.name)+'</option>'; }).join("") +
+        '</select></div>'
+        : '<p style="font-size:11px;color:var(--ink-dim);">Aucun drapeau sur la carte — cet objectif sera à valider manuellement.</p>') +
+      '<button class="btn btn-sm btn-primary" id="btn-sc-add" style="margin-top:4px;">Ajouter l\u2019objectif</button>';
+
+    var triggerHtml;
+    if(scenario.triggered){
+      triggerHtml = '<p style="font-size:12px;color:var(--amber);">☣️ Gaz déclenché — scénario terminé.</p>';
+    } else if(scenario.triggerGas){
+      triggerHtml = '<p style="font-size:12px;color:var(--ink-dim);">☣️ Un gaz se déclenchera automatiquement (centré sur le terrain, rayon '+scenario.triggerGas.initialRadius+' m) une fois <b>tous</b> les objectifs atteints.</p>' +
+        '<button class="btn btn-sm btn-ghost" id="btn-sc-trigger-remove">Retirer ce déclenchement</button>';
+    } else {
+      triggerHtml =
+        '<p style="font-size:12px;color:var(--ink-dim);">Optionnel : déclenche un gaz évolutif dès que TOUS les objectifs sont atteints (centré sur le terrain).</p>' +
+        '<div class="field" style="margin-top:4px;"><label>Rayon de départ (m)</label><input type="number" id="sc-gas-initial" value="80" min="1" /></div>' +
+        '<div class="field"><label>Rétrécit de (m) toutes les</label><input type="number" id="sc-gas-shrink" value="10" min="1" /></div>' +
+        '<div class="field"><label>Minutes par palier</label><input type="number" id="sc-gas-minutes" value="5" min="1" /></div>' +
+        '<div class="field"><label>Rayon minimum (m)</label><input type="number" id="sc-gas-min" value="5" min="1" /></div>' +
+        '<button class="btn btn-sm btn-ghost" id="btn-sc-trigger-add" style="margin-top:4px;">Activer ce déclenchement</button>';
+    }
+
+    el.innerHTML =
+      '<div id="sc-objectives">'+objectivesHtml+'</div>' +
+      addFormHtml +
+      '<p class="mono" style="font-size:10px;color:var(--ink-dim);text-transform:uppercase;margin-top:12px;">Déclenchement final (optionnel)</p>' +
+      triggerHtml;
+
+    document.getElementById("btn-sc-add").onclick = async function(){
+      var title = document.getElementById("sc-new-title").value.trim();
+      if(!title) return;
+      var flagSel = document.getElementById("sc-new-flag");
+      var teamSel = document.getElementById("sc-new-team");
+      scenario.objectives.push({
+        id: genId("obj"), title: title,
+        linkedFlagId: (flagSel && flagSel.value) ? flagSel.value : null,
+        requiredTeam: (teamSel && teamSel.value) ? teamSel.value : null,
+        completed: false, completedAt: null
+      });
+      await saveEventConfig(state.event);
+      renderScenarioPanel(zones);
+    };
+    Array.prototype.forEach.call(el.querySelectorAll(".sc-complete"), function(btn){
+      btn.onclick = async function(){
+        var obj = scenario.objectives.find(function(o){ return o.id === btn.dataset.id; });
+        if(obj){ obj.completed = true; obj.completedAt = Date.now(); await saveEventConfig(state.event); renderScenarioPanel(zones); }
+      };
+    });
+    Array.prototype.forEach.call(el.querySelectorAll(".sc-del"), function(btn){
+      btn.onclick = async function(){
+        scenario.objectives = scenario.objectives.filter(function(o){ return o.id !== btn.dataset.id; });
+        await saveEventConfig(state.event);
+        renderScenarioPanel(zones);
+      };
+    });
+    var addTriggerBtn = document.getElementById("btn-sc-trigger-add");
+    if(addTriggerBtn) addTriggerBtn.onclick = async function(){
+      scenario.triggerGas = {
+        initialRadius: Math.max(1, parseFloat(document.getElementById("sc-gas-initial").value) || 80),
+        shrinkAmount: Math.max(1, parseFloat(document.getElementById("sc-gas-shrink").value) || 10),
+        phaseMinutes: Math.max(1, parseFloat(document.getElementById("sc-gas-minutes").value) || 5),
+        minRadius: Math.max(1, parseFloat(document.getElementById("sc-gas-min").value) || 5)
+      };
+      await saveEventConfig(state.event);
+      renderScenarioPanel(zones);
+    };
+    var removeTriggerBtn = document.getElementById("btn-sc-trigger-remove");
+    if(removeTriggerBtn) removeTriggerBtn.onclick = async function(){
+      scenario.triggerGas = null;
+      await saveEventConfig(state.event);
+      renderScenarioPanel(zones);
+    };
+  }
+
+  // Vérifie les objectifs liés à un drapeau (auto-complétion) et déclenche le gaz de fin si
+  // configuré, une fois que TOUS les objectifs sont atteints. Ne fait rien si le scénario est
+  // vide ou déjà entièrement traité.
+  function tickScenario(zones){
+    if(!state.event || !state.event.scenario) return null;
+    var scenario = state.event.scenario;
+    if(!scenario.objectives || !scenario.objectives.length) return null;
+    var changed = false;
+    scenario.objectives.forEach(function(o){
+      if(o.completed || !o.linkedFlagId) return;
+      var z = zones.find(function(zz){ return zz.id === o.linkedFlagId; });
+      if(!z) return;
+      var ownerOk = o.requiredTeam ? (z.captureOwner === o.requiredTeam) : !!z.captureOwner;
+      if(ownerOk){ o.completed = true; o.completedAt = Date.now(); changed = true; }
+    });
+    var allDone = scenario.objectives.every(function(o){ return o.completed; });
+    var newGasZone = null;
+    if(allDone && scenario.triggerGas && !scenario.triggered){
+      scenario.triggered = true;
+      changed = true;
+      var g = scenario.triggerGas;
+      newGasZone = {
+        id: genId("gas"), kind: "gaz", name: "Gaz (scénario)", center: state.event.center,
+        initialRadius: g.initialRadius, shrinkAmount: g.shrinkAmount, phaseMinutes: g.phaseMinutes,
+        minRadius: g.minRadius, startAt: Date.now(), frozenRadius: null
+      };
+    }
+    return changed ? { newGasZone: newGasZone } : null;
+  }
+
+  function updateScenarioBanner(){
+    var el = document.getElementById("scenario-banner");
+    if(!el) return;
+    var scenario = state.event && state.event.scenario;
+    if(!scenario || !scenario.objectives || !scenario.objectives.length){ el.innerHTML = ""; return; }
+    var total = scenario.objectives.length;
+    var done = scenario.objectives.filter(function(o){ return o.completed; }).length;
+    var current = scenario.objectives.find(function(o){ return !o.completed; });
+    var label = current ? escapeHtml(current.title) : "Tous les objectifs atteints";
+    el.innerHTML = '<div class="warzone-alert pending">' +
+      '<div class="wz-name">📂 Scénario — '+done+'/'+total+'</div>' +
+      '<div class="wz-time" style="font-size:14px;">'+label+'</div>' +
+    '</div>';
+  }
+
   function renderMap(){
     var cfg = state.event;
     app.innerHTML =
       '<div class="topbar"><button class="back">‹ Quitter</button><div class="eyebrow">'+escapeHtml(cfg.name)+' · '+cfg.code+'</div></div>' +
-      '<div class="map-rotate-wrapper" id="map-wrapper"><div id="map"></div><button class="map-fullscreen-btn" id="btn-fullscreen-map" title="Plein écran">⛶</button><div class="warzone-banner-overlay"><div id="warzone-banner"></div><div id="fog-banner"></div><div id="radar-bonus-banner"></div><div id="flag-banner"></div></div></div>' +
+      '<div class="map-rotate-wrapper" id="map-wrapper"><div id="map"></div><button class="map-fullscreen-btn" id="btn-fullscreen-map" title="Plein écran">⛶</button><div class="warzone-banner-overlay"><div id="scenario-banner"></div><div id="warzone-banner"></div><div id="gas-banner"></div><div id="fog-banner"></div><div id="radar-bonus-banner"></div><div id="flag-banner"></div><div id="scoreboard"></div><div id="lives-board"></div></div></div>' +
       '<div class="status-bar"><span class="status-dot" id="status-dot"></span><span id="status-text">Initialisation…</span></div>' +
       '<p id="zone-danger-note" class="mono" style="font-size:11px;color:#f2a89a;margin-top:4px;"></p>' +
       '<p id="offline-indicator" class="mono" style="font-size:11px;color:var(--amber);margin-top:4px;display:none;"></p>' +
@@ -2790,8 +3278,10 @@
       '<div class="row" style="margin-top:10px;">' +
         '<button class="btn btn-sm '+(state.player.sos?'btn-danger':'btn-ghost')+'" id="btn-sos">'+(state.player.sos?'🆘 Annuler la demande d\u2019aide':'🆘 Demander de l\u2019aide')+'</button>' +
         '<button class="btn btn-sm btn-ghost" id="btn-ping-menu">📍 Ping</button>' +
+        '<button class="btn btn-sm '+(state.trailDuration?'btn-primary':'btn-ghost')+'" id="btn-trail-menu">🛤️ Trajectoire</button>' +
       '</div>' +
       '<div id="ping-menu"></div>' +
+      '<div id="trail-menu"></div>' +
       '<div id="staff-actions"></div>' +
       '<div id="claim-admin"></div>' +
       '<div class="field" style="margin-top:12px;"><input type="text" id="roster-search" placeholder="Rechercher un joueur…" value="'+escapeHtml(state.rosterSearch)+'" /></div>' +
@@ -2862,6 +3352,13 @@
           refreshPings();
         };
       });
+    };
+
+    document.getElementById("btn-trail-menu").onclick = function(){
+      var el = document.getElementById("trail-menu");
+      if(el.dataset.open === "1"){ el.innerHTML = ""; el.dataset.open = ""; return; }
+      el.dataset.open = "1";
+      renderTrailMenu();
     };
 
     if(!LIBS_OK.leaflet){
@@ -2949,7 +3446,7 @@
   // données déjà en cache — pas besoin d'interroger le réseau plus souvent pour ça.
   function startWarzoneTicker(){
     if(state.warzoneTickTimer) return;
-    state.warzoneTickTimer = setInterval(function(){ updateWarzoneBanner(state.cachedZones); updateFogBanner(); updateRadarBonusBanner(); updateFlagCaptureBanner(state.cachedZones); }, 1000);
+    state.warzoneTickTimer = setInterval(function(){ updateWarzoneBanner(state.cachedZones); updateGasBanner(state.cachedZones); updateFogBanner(); updateRadarBonusBanner(); updateFlagCaptureBanner(state.cachedZones); }, 1000);
   }
   function stopWarzoneTicker(){
     if(state.warzoneTickTimer){ clearInterval(state.warzoneTickTimer); state.warzoneTickTimer = null; }
@@ -3140,7 +3637,49 @@
       payload.role = "staff";
       state.player._grantStaffOnJoin = false;
     }
+
+    // ☠️ Match à mort : initialise les vies si le mode vient d'être activé, puis retire une
+    // vie au moment précis où le joueur ENTRE dans une zone de spawn (pas à chaque cycle
+    // passé dedans — seulement sur la transition dehors→dedans).
+    if(state.event.deathmatchEnabled){
+      if(typeof state.player.livesRemaining !== "number"){
+        payload.livesRemaining = state.event.deathmatchLives || 3;
+        state.player.livesRemaining = payload.livesRemaining;
+      } else {
+        var inSpawn = (state.cachedZones||[]).some(function(z){
+          return (z.kind === "building" || !z.kind) && z.status === "spawn" && isValidZone(z) &&
+            pointInPolygon(state.lastCoords.lat, state.lastCoords.lng, z.points);
+        });
+        if(inSpawn && !state.player._wasInSpawn && state.player.livesRemaining > 0){
+          payload.livesRemaining = state.player.livesRemaining - 1;
+          state.player.livesRemaining = payload.livesRemaining;
+        }
+        state.player._wasInSpawn = inSpawn;
+      }
+    }
+
     await upsertPlayer(state.event.code, state.playerId, payload);
+  }
+
+  // ---------- Affichage Match à mort : vies individuelles + totaux par équipe ----------
+  function updateLivesBoard(players){
+    var el = document.getElementById("lives-board");
+    if(!el) return;
+    if(!state.event || !state.event.deathmatchEnabled){ el.innerHTML = ""; return; }
+    var totals = {};
+    Object.keys(players||{}).forEach(function(pid){
+      var p = players[pid];
+      if(!p || !p.team || p.team === "Staff" || typeof p.livesRemaining !== "number") return;
+      totals[p.team] = (totals[p.team]||0) + p.livesRemaining;
+    });
+    var teams = Object.keys(totals);
+    var mine = (typeof state.player.livesRemaining === "number") ? state.player.livesRemaining : null;
+    var myLine = mine !== null ? ('<span class="mono" style="font-size:11px;">❤️ Toi : <b>'+mine+'</b>'+(mine<=0?' — éliminé':'')+'</span>') : '';
+    var teamLines = teams.map(function(t){
+      var col = teamColor(state.event || {}, t);
+      return '<span class="mono" style="font-size:11px;margin-left:8px;color:'+col+';">'+escapeHtml(t)+' <b>'+totals[t]+'</b></span>';
+    }).join("");
+    el.innerHTML = (myLine || teamLines) ? ('<div class="mini-banner"><span class="mono" style="font-size:10px;text-transform:uppercase;color:var(--ink-dim);">☠️ Vies</span> ' + myLine + teamLines + '</div>') : "";
   }
 
   function updateAdminUI(){
@@ -3153,7 +3692,8 @@
       '<button class="btn btn-ghost btn-sm" id="btn-edit-buildings-live">Éditer la carte</button>' +
       '<button class="btn btn-ghost btn-sm" id="btn-roles-live">Rôles & visibilité</button>' +
       '<button class="btn btn-ghost btn-sm" id="btn-code-live">Code / QR</button>' +
-      '<button class="btn btn-ghost btn-sm" id="btn-log-live">📋 Journal SOS</button>';
+      '<button class="btn btn-ghost btn-sm" id="btn-log-live">📋 Journal SOS</button>' +
+      '<button class="btn btn-ghost btn-sm" id="btn-gamemode-live">🕹 Mode de jeu</button>';
     document.getElementById("btn-edit-buildings-live").onclick = async function(){
       var code = state.event.code;
       state.editorMode = "live";
@@ -3177,6 +3717,11 @@
     document.getElementById("btn-log-live").onclick = function(){
       teardownMap();
       state.screen = "log";
+      render();
+    };
+    document.getElementById("btn-gamemode-live").onclick = function(){
+      teardownMap();
+      state.screen = "gamemode";
       render();
     };
   }
@@ -3269,6 +3814,7 @@
     if(amStaff && me && typeof me.staffHidden === "boolean" && !document.getElementById("staff-actions").dataset.bound){
       state.player.staffHidden = me.staffHidden;
     }
+    if(me && typeof me.livesRemaining === "number"){ state.player.livesRemaining = me.livesRemaining; }
 
     updateAdminUI();
     updateStaffUI(amStaff);
@@ -3324,23 +3870,35 @@
 
     updateMarkers(visible);
     updateRoster(visible);
+    updateLivesBoard(players);
   }
 
   // ---------- Capture de drapeaux (façon "Domination" : occupation exclusive requise) ----------
-  var CAPTURE_BASE_SECONDS = 90; // temps pour capturer seul, sans renfort
-  var CAPTURE_MAX_MULTIPLIER = 4; // plafond de bonus de vitesse selon le nombre de joueurs
+  // Vitesse : +10% par joueur au-delà du premier, plafonné à +100% (10 joueurs) pour qu'une
+  // grosse escouade ne rende jamais la capture instantanée. Avec 10 min de base (réglable par
+  // l'organisateur), ça donne : 1 joueur = 10 min, 2 = ~9 min, 5 = ~7 min, 10+ = 5 min pile.
+  var CAPTURE_SPEED_STEP = 0.1;
+  var CAPTURE_SPEED_STEP_CAP = 10;
 
   // Ne fait rien tant que la zone n'a ni progression à figer ni horodatage à rafraîchir —
-  // évite une écriture Firebase à chaque cycle pour des zones drapeau inactives.
-  function tickFlagCaptures(zones, players){
+  // évite une écriture Firebase à chaque cycle pour des zones drapeau inactives. Accumule
+  // aussi le score par équipe (occupation seule d'une zone, propriétaire ou en cours de
+  // capture), selon le rythme choisi par l'organisateur.
+  function tickFlagCaptures(zones, players, cfg){
     var now = Date.now();
     var dirty = false;
+    var scoreDelta = {};
+    var baseSeconds = ((cfg && cfg.captureBaseMinutes) || 10) * 60;
+    var scoreInterval = (cfg && cfg.scoreIntervalSeconds) || 30;
+    var scorePerInterval = (cfg && typeof cfg.scorePointsPerInterval === "number") ? cfg.scorePointsPerInterval : 1;
+
     zones.forEach(function(z){
       if(z.kind !== "drapeau") return;
       var counts = {};
       Object.keys(players||{}).forEach(function(pid){
         var p = players[pid];
         if(!p || !p.team || p.team === "Staff" || p.role === "staff") return;
+        if(typeof p.livesRemaining === "number" && p.livesRemaining <= 0) return; // éliminé (Match à mort) : ne compte plus
         if(typeof p.lat !== "number" || typeof p.lng !== "number") return;
         if(pointInPolygon(p.lat, p.lng, z.points)) counts[p.team] = (counts[p.team]||0) + 1;
       });
@@ -3350,13 +3908,22 @@
 
       if(teamsPresent.length === 1){
         var team = teamsPresent[0];
+        var count = counts[team];
+
+        // Score : accumulé tant qu'une équipe occupe seule la zone (propriétaire ou en
+        // cours de capture) — pas besoin d'attendre que la capture soit terminée.
+        if(scorePerInterval > 0 && elapsed > 0){
+          var pts = scorePerInterval * count * (elapsed / scoreInterval);
+          scoreDelta[team] = (scoreDelta[team]||0) + pts;
+        }
+
         if(team === z.captureOwner){
           if(z.captureLastTick !== now){ z.captureLastTick = now; dirty = true; }
           return;
         }
         if(z.captureTarget !== team){ z.captureTarget = team; z.captureProgress = 0; }
-        var mult = Math.min(counts[team], CAPTURE_MAX_MULTIPLIER);
-        var rate = (100 / CAPTURE_BASE_SECONDS) * mult;
+        var mult = 1 + CAPTURE_SPEED_STEP * Math.min(count - 1, CAPTURE_SPEED_STEP_CAP);
+        var rate = (100 / baseSeconds) * mult;
         z.captureProgress = Math.min(100, (z.captureProgress||0) + rate * elapsed);
         z.captureLastTick = now;
         if(z.captureProgress >= 100){
@@ -3372,7 +3939,7 @@
         if(z.captureLastTick !== now){ z.captureLastTick = now; dirty = true; }
       }
     });
-    return dirty;
+    return { dirty: dirty, scoreDelta: scoreDelta };
   }
 
   function updateFlagCaptureBanner(zones){
@@ -3388,6 +3955,20 @@
         '<div class="flag-progress-track"><div class="flag-progress-fill" style="width:'+pct+'%;"></div></div>' +
       '</div>';
     }).join("");
+  }
+
+  function updateScoreboard(){
+    var el = document.getElementById("scoreboard");
+    if(!el) return;
+    var score = state.cachedScore || {};
+    var teams = Object.keys(score).filter(function(t){ return t !== "Staff"; });
+    if(!teams.length){ el.innerHTML = ""; return; }
+    teams.sort(function(a,b){ return (score[b]||0) - (score[a]||0); });
+    el.innerHTML = '<div class="mini-banner"><span class="mono" style="font-size:10px;text-transform:uppercase;color:var(--ink-dim);">Score</span>' +
+      teams.map(function(t){
+        var col = teamColor(state.event || {}, t);
+        return '<span class="mono" style="font-size:11px;margin-left:8px;color:'+col+';">'+escapeHtml(t)+' <b>'+Math.round(score[t]||0)+'</b></span>';
+      }).join("") + '</div>';
   }
 
   async function refreshZones(){
@@ -3406,15 +3987,36 @@
       if(state.lastCoords){
         var amInFlag = zones.some(function(z){ return z.kind === "drapeau" && pointInPolygon(state.lastCoords.lat, state.lastCoords.lng, z.points); });
         if(amInFlag){
-          var changed = tickFlagCaptures(zones, state.cachedAllPlayers || {});
-          if(changed) await saveZones(state.event.code, zones);
+          var tick = tickFlagCaptures(zones, state.cachedAllPlayers || {}, state.event);
+          if(tick.dirty) await saveZones(state.event.code, zones);
+          var teamsWithDelta = Object.keys(tick.scoreDelta);
+          if(teamsWithDelta.length){
+            var score = await loadScore(state.event.code);
+            teamsWithDelta.forEach(function(team){ score[team] = (score[team]||0) + tick.scoreDelta[team]; });
+            await saveScore(state.event.code, score);
+            state.cachedScore = score;
+          }
+        }
+      }
+      // Scénario personnalisé : auto-complète les objectifs liés à un drapeau déjà capturé,
+      // et déclenche le gaz de fin si tous les objectifs viennent d'être atteints.
+      var scResult = tickScenario(zones);
+      if(scResult){
+        await saveEventConfig(state.event);
+        if(scResult.newGasZone){
+          zones.push(scResult.newGasZone);
+          await saveZones(state.event.code, zones);
         }
       }
     }
     state.cachedZones = zones;
     updateZonePolygons(zones);
     updateWarzoneBanner(zones);
+    updateGasBanner(zones);
     updateFlagCaptureBanner(zones);
+    updateScenarioBanner();
+    if(state.networkOk){ state.cachedScore = await loadScore(state.event.code); }
+    updateScoreboard();
   }
 
   // ---------- Repli hors-ligne : dernière image connue (joueurs, zones, visibilité) ----------
@@ -3480,11 +4082,28 @@
     el.innerHTML = warzones.map(function(z){
       var wz = warzoneStyle(z);
       return '<div class="warzone-alert '+(wz.active?'active':'pending')+'">' +
-        '<div class="wz-name">'+(wz.active?'☠ ':'⚠ ')+escapeHtml(z.name)+'</div>' +
+        '<div class="wz-name">'+(wz.active?'☢️ ':'⚠ ')+escapeHtml(z.name)+'</div>' +
         '<div class="wz-time">'+wz.label+'</div>' +
       '</div>';
     }).join("");
     updateZoneDangerNote(zones);
+  }
+
+  function updateGasBanner(zones){
+    var el = document.getElementById("gas-banner");
+    if(!el) return;
+    var gasZones = (zones||[]).filter(function(z){ return z.kind === "gaz" && isValidZone(z); });
+    if(!gasZones.length){ el.innerHTML = ""; return; }
+    el.innerHTML = gasZones.map(function(z){
+      var gs = gasCurrentState(z);
+      var timeTxt = gs.nextShrinkMs !== null
+        ? ('Rétrécit dans ' + Math.floor(gs.nextShrinkMs/60000) + ':' + ("0"+Math.floor((gs.nextShrinkMs%60000)/1000)).slice(-2))
+        : (z.frozenRadius !== null && z.frozenRadius !== undefined ? 'Figé par l\u2019organisateur' : 'Rayon minimum atteint');
+      return '<div class="warzone-alert active">' +
+        '<div class="wz-name">☣️ '+escapeHtml(z.name)+' — zone sûre '+Math.round(gs.radius)+' m</div>' +
+        '<div class="wz-time">'+timeTxt+'</div>' +
+      '</div>';
+    }).join("");
   }
 
   // Repère (algorithme du lancer de rayon) si un point est à l'intérieur d'un polygone.
@@ -3508,6 +4127,22 @@
     var dLat = toRad(lat2-lat1), dLng = toRad(lng2-lng1);
     var a = Math.sin(dLat/2)*Math.sin(dLat/2) + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLng/2)*Math.sin(dLng/2);
     return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  }
+  // Approxime un cercle géographique par un polygone à N côtés — largement suffisant à
+  // l'échelle d'un terrain d'airsoft (la courbure terrestre est négligeable ici).
+  function circlePolygonPoints(centerLat, centerLng, radiusMeters, sides){
+    sides = sides || 28;
+    var R = 6371000;
+    var points = [];
+    for(var i=0; i<sides; i++){
+      var angle = (i / sides) * 2 * Math.PI;
+      var dx = radiusMeters * Math.cos(angle);
+      var dy = radiusMeters * Math.sin(angle);
+      var dLat = (dy / R) * (180/Math.PI);
+      var dLng = (dx / (R * Math.cos(centerLat * Math.PI/180))) * (180/Math.PI);
+      points.push([centerLat + dLat, centerLng + dLng]);
+    }
+    return points;
   }
   function bearingCardinal(lat1, lng1, lat2, lng2){
     var toRad = function(d){ return d * Math.PI / 180; };
@@ -3539,13 +4174,24 @@
         if(wz.active && pointInPolygon(state.lastCoords.lat, state.lastCoords.lng, z.points)) inside = z.name;
       }
     });
-    el.textContent = inside ? ("⚠ Tu sembles être dans « "+inside+" » (zone interdite) — le GPS peut être imprécis de quelques mètres, vérifie visuellement.") : "";
+    var inGas = null;
+    (zones||[]).forEach(function(z){
+      if(z.kind === "gaz" && isValidZone(z)){
+        var gs = gasCurrentState(z);
+        var d = distanceMeters(state.lastCoords.lat, state.lastCoords.lng, z.center.lat, z.center.lng);
+        if(d > gs.radius) inGas = z.name;
+      }
+    });
+    if(inside){ el.textContent = "⚠ Tu sembles être dans « "+inside+" » (zone interdite) — le GPS peut être imprécis de quelques mètres, vérifie visuellement."; }
+    else if(inGas){ el.textContent = "☣️ Tu sembles être hors de la zone sûre de « "+inGas+" » — le GPS peut être imprécis de quelques mètres, vérifie visuellement."; }
+    else{ el.textContent = ""; }
   }
 
   function isValidZone(z){
     if(!z || !z.id) return false;
     if(z.kind === "point") return Array.isArray(z.latlng) && z.latlng.length === 2;
     if(z.kind === "mur" || z.kind === "demimur") return Array.isArray(z.points) && z.points.length >= 2;
+    if(z.kind === "gaz") return !!(z.center && typeof z.center.lat === "number" && typeof z.center.lng === "number");
     return Array.isArray(z.points) && z.points.length >= 3;
   }
 
@@ -3566,6 +4212,18 @@
             layer.setStyle({ color: wz.color, fillColor: wz.color, fillOpacity: wz.fillOpacity, dashArray: wz.dashArray });
             if(layer._path) layer._path.classList.toggle('zone-objectif', !!wz.active);
             layer.setTooltipContent(escapeHtml(z.name) + ' · ' + wz.label);
+          } else if(z.kind === "drapeau"){
+            var flagLayer = state.zonesLayers[z.id];
+            var ownerColor2 = z.captureOwner ? teamColor(state.event || {}, z.captureOwner) : '#8f8b7a';
+            flagLayer.setStyle({ color: ownerColor2, fillColor: ownerColor2, fillOpacity: z.captureOwner ? 0.3 : 0.12 });
+            var flagLabel2 = z.captureOwner ? (escapeHtml(z.name) + ' · tenue par ' + escapeHtml(z.captureOwner)) :
+              (z.captureTarget ? (escapeHtml(z.name) + ' · capture par ' + escapeHtml(z.captureTarget) + ' (' + Math.round(z.captureProgress||0) + '%)') : (escapeHtml(z.name) + ' · neutre'));
+            flagLayer.setTooltipContent(flagLabel2);
+          } else if(z.kind === "gaz"){
+            var gasLayer = state.zonesLayers[z.id];
+            var gs3 = gasCurrentState(z);
+            gasLayer.setLatLngs(circlePolygonPoints(z.center.lat, z.center.lng, gs3.radius, 40));
+            gasLayer.setTooltipContent(escapeHtml(z.name) + ' · zone sûre ' + Math.round(gs3.radius) + ' m');
           }
           return;
         }
@@ -3580,14 +4238,25 @@
   function updateMarkers(players){
     if(!state.map) return;
     var seen = {};
+    var now = Date.now();
     Object.keys(players).forEach(function(pid){
       var p = players[pid];
+      // Accumule la trajectoire (position + heure) pour ce joueur, qu'elle soit affichée
+      // ou non pour l'instant — plafonné à 5 minutes pour ne jamais grossir indéfiniment.
+      // Purement local : rien n'est envoyé sur Firebase pour ça.
+      if(!state.trails[pid]) state.trails[pid] = [];
+      var trail = state.trails[pid];
+      var lastPt = trail[trail.length-1];
+      if(!lastPt || lastPt.lat !== p.lat || lastPt.lng !== p.lng){ trail.push({ lat: p.lat, lng: p.lng, ts: now }); }
+      while(trail.length && (now - trail[0].ts) > 300000){ trail.shift(); }
+
       var isMe = pid === state.playerId;
       seen[pid] = true;
       var color = teamColor(state.event, p.team) || "#9b9b9b";
       var initials = (p.name||"?").trim().slice(0,2).toUpperCase();
       var badgeGlyph = initials, badgeSize = "11px";
-      if(p.infected){ badgeGlyph = "🧟"; badgeSize = "13px"; color = "#3e6b2f"; }
+      if(typeof p.livesRemaining === "number" && p.livesRemaining <= 0){ badgeGlyph = "☠️"; badgeSize = "13px"; color = "#4a4a4a"; }
+      else if(p.infected){ badgeGlyph = "🧟"; badgeSize = "13px"; color = "#3e6b2f"; }
       else if(p.isAdmin){ badgeGlyph = "👑"; badgeSize = "13px"; }
       else if(p.role === "staff"){ badgeGlyph = "🛡"; badgeSize = "13px"; }
       var html = '<div class="marker-badge'+(isMe?' me':'')+(p.sos?' sos':'')+'" style="background:'+color+';font-size:'+badgeSize+';">'+escapeHtml(badgeGlyph)+'</div>';
@@ -3621,6 +4290,73 @@
     });
     applyLabelZoomVisibility();
     updateMarkerClusters();
+    renderTrails(players);
+  }
+
+  // ---------- Trajectoire récente (joueur / escouade / équipe) — purement locale ----------
+  function renderTrails(players){
+    if(!state.map) return;
+    if(!state.trailLayers) state.trailLayers = {};
+    Object.keys(state.trailLayers).forEach(function(pid){ state.map.removeLayer(state.trailLayers[pid]); });
+    state.trailLayers = {};
+    if(!state.trailDuration || !state.trailScope) return;
+
+    var now = Date.now();
+    var cutoff = now - state.trailDuration;
+    var myTeam = state.player.team;
+    var mySquad = state.player.squad;
+
+    Object.keys(players).forEach(function(pid){
+      var p = players[pid];
+      if(!p) return;
+      var include = state.trailScope === "me" ? (pid === state.playerId) :
+        state.trailScope === "team" ? (p.team === myTeam) :
+        state.trailScope === "squad" ? (p.team === myTeam && (p.squad||"") === mySquad) : false;
+      if(!include) return;
+      var trail = (state.trails[pid]||[]).filter(function(pt){ return pt.ts >= cutoff; });
+      if(trail.length < 2) return;
+      var pts = trail.map(function(pt){ return [pt.lat, pt.lng]; });
+      var col = teamColor(state.event || {}, p.team) || "#e7ddc9";
+      state.trailLayers[pid] = L.polyline(pts, { color: col, weight:2.5, dashArray:'2,7', opacity:0.75 }).addTo(state.map);
+    });
+  }
+
+  function renderTrailMenu(){
+    var el = document.getElementById("trail-menu");
+    if(!el) return;
+    var durations = [ {label:"30s", ms:30000}, {label:"2 min", ms:120000}, {label:"5 min", ms:300000} ];
+    el.innerHTML =
+      '<p class="mono" style="font-size:10px;color:var(--ink-dim);text-transform:uppercase;margin-top:6px;">Durée</p>' +
+      '<div class="row">' +
+        durations.map(function(d){
+          return '<button class="btn btn-sm '+(state.trailDuration===d.ms?'btn-primary':'btn-ghost')+' trail-dur" data-ms="'+d.ms+'">'+d.label+'</button>';
+        }).join("") +
+        '<button class="btn btn-sm '+(!state.trailDuration?'btn-primary':'btn-ghost')+' trail-dur" data-ms="0">Désactivée</button>' +
+      '</div>' +
+      '<p class="mono" style="font-size:10px;color:var(--ink-dim);text-transform:uppercase;margin-top:8px;">Portée</p>' +
+      '<div class="row">' +
+        '<button class="btn btn-sm '+(state.trailScope==="me"?'btn-primary':'btn-ghost')+' trail-scope" data-scope="me">Moi</button>' +
+        (state.player.squad ? ('<button class="btn btn-sm '+(state.trailScope==="squad"?'btn-primary':'btn-ghost')+' trail-scope" data-scope="squad">Mon escouade</button>') : '') +
+        '<button class="btn btn-sm '+(state.trailScope==="team"?'btn-primary':'btn-ghost')+' trail-scope" data-scope="team">Mon équipe</button>' +
+      '</div>';
+    Array.prototype.forEach.call(el.querySelectorAll(".trail-dur"), function(btn){
+      btn.onclick = function(){
+        state.trailDuration = parseInt(btn.dataset.ms, 10) || 0;
+        if(state.trailDuration && !state.trailScope) state.trailScope = "me";
+        if(!state.trailDuration) state.trailScope = null;
+        var mainBtn = document.getElementById("btn-trail-menu");
+        if(mainBtn) mainBtn.className = "btn btn-sm " + (state.trailDuration ? "btn-primary" : "btn-ghost");
+        renderTrails(state.cachedAllPlayers || {});
+        renderTrailMenu();
+      };
+    });
+    Array.prototype.forEach.call(el.querySelectorAll(".trail-scope"), function(btn){
+      btn.onclick = function(){
+        state.trailScope = btn.dataset.scope;
+        renderTrails(state.cachedAllPlayers || {});
+        renderTrailMenu();
+      };
+    });
   }
 
   // ---------- Regroupement des marqueurs trop proches à l'écran (badge avec compteur) ----------
@@ -3726,6 +4462,10 @@
     state.clusterMarkers = [];
     state.fogUntil = null;
     state.radarBonusUntil = null;
+    state.trails = {};
+    state.trailLayers = {};
+    state.trailDuration = 0;
+    state.trailScope = null;
   }
 
   // Quand l'appli est vraiment fermée (onglet fermé, appli quittée) : on arrête le GPS et les
