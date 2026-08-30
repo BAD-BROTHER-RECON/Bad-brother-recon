@@ -230,6 +230,15 @@
   .banner.info{ border-color:var(--amber-dim); color:var(--amber); }
 
   .test-toggle{ display:flex; align-items:center; justify-content:space-between; gap:10px; margin-top:10px; }
+  .ping-grid{ display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-top:8px; }
+  .ping-grid .btn{ font-size:12px; padding:9px 8px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .ping-marker{ font-size:20px; line-height:1; filter:drop-shadow(0 1px 3px rgba(0,0,0,.7)); animation:pingPulse 1.4s ease-in-out infinite; }
+  @keyframes pingPulse{ 0%,100%{ transform:scale(1); } 50%{ transform:scale(1.18); } }
+  .cluster-badge{ display:flex; align-items:center; justify-content:center; width:28px; height:28px; border-radius:50%;
+    background:var(--amber-red, #a2231f); color:#fff; font-weight:700; font-size:13px; border:2px solid rgba(231,221,201,.85);
+    box-shadow:0 2px 6px rgba(0,0,0,.5); }
+  .seg-label{ font-size:10.5px; font-family:'JetBrains Mono', monospace; color:#191a10; background:rgba(231,221,201,.92);
+    padding:1px 5px; border-radius:2px; white-space:nowrap; text-align:center; box-shadow:0 1px 3px rgba(0,0,0,.4); }
   .row{ display:flex; gap:8px; }
   .row > *{ flex:1; }
 
@@ -408,6 +417,13 @@
     editorMeMarker: null,
     cachedZones: [],
     modAuthed: false,
+    batteryLevel: null,
+    batterySaverMode: false,
+    batteryWatched: false,
+    networkOk: true,
+    cachedPings: [],
+    fogUntil: null,
+    radarBonusUntil: null,
     pendingLibraryHighlight: null,
     warzoneTickTimer: null,
     _draftZones: []
@@ -470,14 +486,58 @@
 
   function dbConfigured(){ return !!FIREBASE_DB_URL; }
 
+  // ---------- Tuiles de carte mises en cache (Cache API) ----------
+  // Les tuiles vues en ligne sont gardées en cache local ; si la connexion coupe en
+  // pleine partie, les zones déjà consultées restent visibles au lieu d'un fond gris.
+  // Best effort : sans "Cache API" (vieux navigateur), on retombe simplement sur le
+  // chargement réseau classique de Leaflet, sans rien casser.
+  var TILE_CACHE_NAME = "badrecon-tiles-v1";
+  function createCachedTileLayer(){
+    var url = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
+    var opts = { maxZoom: 19, attribution: '&copy; OpenStreetMap', subdomains: 'abc' };
+    if(!('caches' in window)) return L.tileLayer(url, opts);
+
+    var CachedLayer = L.TileLayer.extend({
+      createTile: function(coords, done){
+        var img = document.createElement('img');
+        img.setAttribute('role', 'presentation');
+        var tileUrl = this.getTileUrl(coords);
+        caches.open(TILE_CACHE_NAME).then(function(cache){
+          cache.match(tileUrl).then(function(cached){
+            if(cached){
+              cached.blob().then(function(blob){ img.src = URL.createObjectURL(blob); });
+            }
+            fetch(tileUrl).then(function(resp){
+              if(resp && resp.ok){
+                cache.put(tileUrl, resp.clone());
+                if(!cached) resp.blob().then(function(blob){ img.src = URL.createObjectURL(blob); });
+              } else if(!cached){
+                done('tuile indisponible', img);
+              }
+            }).catch(function(){
+              // Hors ligne : on garde la version en cache si on en avait une ; sinon,
+              // la tuile restera simplement vide à cet endroit.
+              if(!cached) done(null, img);
+            });
+          });
+        });
+        img.onload = function(){ done(null, img); };
+        img.onerror = function(){ done(null, img); };
+        return img;
+      }
+    });
+    return new CachedLayer(url, opts);
+  }
+
   async function storageGet(key){
     if(!dbConfigured()) return null;
     try{
       var res = await fetch(FIREBASE_DB_URL + "/" + key + ".json");
+      state.networkOk = true;
       if(!res.ok) return null;
       var data = await res.json();
       return data; // déjà la chaîne JSON qu'on avait stockée (ou null si absente)
-    }catch(e){ return null; }
+    }catch(e){ state.networkOk = false; return null; }
   }
   async function storageSet(key, value){
     if(!dbConfigured()) return false;
@@ -511,6 +571,36 @@
     log.push(entry);
     if(log.length > 200) log = log.slice(log.length - 200);
     return storageSet(eventLogKey(code), JSON.stringify(log));
+  }
+
+  // ---------- Pings temporaires (repères tactiques rapides, 30s) ----------
+  var PING_DURATION_MS = 30000;
+  var PING_KINDS = [
+    { kind:"pnj",      emoji:"\ud83e\uddcd\u200d\u2642\ufe0f", label:"PNJ" },
+    { kind:"objectif", emoji:"\ud83c\udfaf", label:"Objectif rep\u00e9r\u00e9" },
+    { kind:"gaz",      emoji:"\u2623\ufe0f", label:"Gaz" },
+    { kind:"objet",    emoji:"\ud83d\udce6", label:"Objet trouv\u00e9" },
+    { kind:"danger",   emoji:"\u26a0\ufe0f", label:"Danger" },
+    { kind:"contact",  emoji:"\ud83d\udea8", label:"Contact" },
+    { kind:"ennemi",   emoji:"\ud83d\udc41", label:"Ennemi aper\u00e7u" },
+    { kind:"bombe",    emoji:"\ud83d\udca3", label:"Bombe trouv\u00e9e/pos\u00e9e" }
+  ];
+  function eventPingsKey(code){ return "event:" + code + ":pings"; }
+  async function loadPings(code){
+    var raw = await storageGet(eventPingsKey(code));
+    if(!raw) return [];
+    try{ return JSON.parse(raw); }catch(e){ return []; }
+  }
+  async function addPing(code, kindDef, lat, lng){
+    var pings = await loadPings(code);
+    var now = Date.now();
+    // On profite de cet envoi pour nettoyer les pings expir\u00e9s, sans job d\u00e9di\u00e9.
+    pings = pings.filter(function(p){ return (now - p.ts) < PING_DURATION_MS; });
+    pings.push({
+      id: genId("ping"), kind: kindDef.kind, emoji: kindDef.emoji, label: kindDef.label,
+      lat: lat, lng: lng, team: state.player.team || null, playerName: state.player.name || "?", ts: now
+    });
+    return storageSet(eventPingsKey(code), JSON.stringify(pings));
   }
 
   async function loadEventConfig(code){
@@ -1238,9 +1328,7 @@
     }
 
     var map = L.map('editor-map', { zoomControl: true }).setView([center.lat, center.lng], 17);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      maxZoom: 19, attribution: '&copy; OpenStreetMap'
-    }).addTo(map);
+    createCachedTileLayer().addTo(map);
     state.editorMap = map;
     state.editorLayers = {};
     startEditorGeoWatch();
@@ -1396,12 +1484,14 @@
     var layers = [poly];
 
     if(isEditingThis){
+      renderSegmentLabels(map, z.points, !useLine);
       z.points.forEach(function(pt, idx){
         var handle = L.marker(pt, { icon: vertexHandleIcon(), draggable: true }).addTo(map);
         handle.on('drag', function(e){
           var ll = e.target.getLatLng();
           z.points[idx] = [ll.lat, ll.lng];
           poly.setLatLngs(z.points);
+          renderSegmentLabels(map, z.points, !useLine);
         });
         handle.on('dragend', async function(){ await persistEditorZones(); });
         layers.push(handle);
@@ -1427,12 +1517,36 @@
       layers.forEach(function(l){ state.editorMap.removeLayer(l); });
     });
     state.editorLayers = {};
+    clearSegmentLabels();
     orderedZones(state.editorZones).forEach(function(z){
       if(!isValidZone(z)) return;
       try{
         state.editorLayers[z.id] = addEditableZoneLayer(state.editorMap, z);
       }catch(e){ /* une zone corrompue ne doit pas empêcher l'affichage des autres */ }
     });
+  }
+
+  // ---------- Étiquettes de distance (mètres) sur les segments en cours de tracé/édition ----------
+  function clearSegmentLabels(){
+    if(state.segmentLabelLayers){
+      state.segmentLabelLayers.forEach(function(l){ if(l._map) l._map.removeLayer(l); });
+    }
+    state.segmentLabelLayers = [];
+  }
+  function renderSegmentLabels(map, points, closeLoop){
+    clearSegmentLabels();
+    if(!map || !points || points.length < 2) return;
+    var count = closeLoop ? points.length : points.length - 1;
+    for(var i=0; i<count; i++){
+      var a = points[i];
+      var b = points[(i+1) % points.length];
+      var mid = [ (a[0]+b[0])/2, (a[1]+b[1])/2 ];
+      var d = distanceMeters(a[0], a[1], b[0], b[1]);
+      var label = d < 10 ? (d.toFixed(1)+" m") : (Math.round(d)+" m");
+      var icon = L.divIcon({ html:'<div class="seg-label">'+label+'</div>', className:'', iconSize:[54,18], iconAnchor:[27,9] });
+      var marker = L.marker(mid, { icon: icon, interactive:false }).addTo(map);
+      state.segmentLabelLayers.push(marker);
+    }
   }
 
   function updateDrawPreview(){
@@ -1445,6 +1559,9 @@
         ? L.polyline(state.drawPoints, { color:color, dashArray:'4,4', weight:3 }).addTo(state.editorMap)
         : L.polygon(state.drawPoints, { color:color, dashArray:'4,4', weight:2, fillOpacity:0.12 }).addTo(state.editorMap);
     }
+    // Pas encore refermée pendant le tracé (même pour un bâtiment/terrain) : on ne mesure
+    // que les segments déjà posés, pas un segment de clôture qui n'existe pas encore.
+    renderSegmentLabels(state.editorMap, state.drawPoints, false);
   }
 
   function drawToolbar(){
@@ -1773,6 +1890,7 @@
     stopEditorGeoWatch();
     if(state.editorMap){ state.editorMap.remove(); state.editorMap = null; }
     state.editorLayers = {};
+    state.segmentLabelLayers = [];
   }
 
   // ---------- Écran Rôles & visibilité (organisateur) ----------
@@ -1803,6 +1921,26 @@
         '<label class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">🧟 Mode zombie</label>' +
         '<p style="margin-top:4px;">Désigne un ou plusieurs joueurs comme zombies — leur point affiche 🧟 au lieu de leurs initiales.</p>' +
         '<div id="zombie-list" style="margin-top:8px;"></div>' +
+      '</div>' +
+      '<div class="panel" style="margin-top:14px;">' +
+        '<label class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">🌫 Brouillard (punition temporaire)</label>' +
+        '<p style="margin-top:4px;">Coupe le radar pendant la durée choisie : plus personne d\u2019autre visible sur la carte (ni les pings), le terrain reste affiché. Pensé comme sanction (triche, débordement), pas comme mécanique de jeu classique.</p>' +
+        '<p class="mono" style="font-size:10px;color:var(--ink-dim);text-transform:uppercase;margin-top:10px;">Équipe entière</p>' +
+        '<div id="fog-team-list" style="margin-top:6px;"></div>' +
+        '<p class="mono" style="font-size:10px;color:var(--ink-dim);text-transform:uppercase;margin-top:10px;">Escouade</p>' +
+        '<div id="fog-squad-list" style="margin-top:6px;"></div>' +
+        '<p class="mono" style="font-size:10px;color:var(--ink-dim);text-transform:uppercase;margin-top:10px;">Joueur individuel</p>' +
+        '<div id="fog-list" style="margin-top:6px;"></div>' +
+      '</div>' +
+      '<div class="panel" style="margin-top:14px;">' +
+        '<label class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">📡 Bonus radar (récompense temporaire)</label>' +
+        '<p style="margin-top:4px;">Donne temporairement la vision de toutes les équipes, comme si le staff l\u2019avait débloqué pour eux. Pratique pour récompenser un joueur, une escouade ou une équipe en jeu.</p>' +
+        '<p class="mono" style="font-size:10px;color:var(--ink-dim);text-transform:uppercase;margin-top:10px;">Équipe entière</p>' +
+        '<div id="bonus-team-list" style="margin-top:6px;"></div>' +
+        '<p class="mono" style="font-size:10px;color:var(--ink-dim);text-transform:uppercase;margin-top:10px;">Escouade</p>' +
+        '<div id="bonus-squad-list" style="margin-top:6px;"></div>' +
+        '<p class="mono" style="font-size:10px;color:var(--ink-dim);text-transform:uppercase;margin-top:10px;">Joueur individuel</p>' +
+        '<div id="bonus-list" style="margin-top:6px;"></div>' +
       '</div>';
 
     document.querySelector(".back").onclick = function(){ state.screen = "map"; render(); };
@@ -1821,10 +1959,22 @@
       var staffEl = document.getElementById("staff-list");
       var transferEl = document.getElementById("admin-transfer");
       var zombieEl = document.getElementById("zombie-list");
+      var fogEl = document.getElementById("fog-list");
+      var fogTeamEl = document.getElementById("fog-team-list");
+      var fogSquadEl = document.getElementById("fog-squad-list");
+      var bonusEl = document.getElementById("bonus-list");
+      var bonusTeamEl = document.getElementById("bonus-team-list");
+      var bonusSquadEl = document.getElementById("bonus-squad-list");
       teamsEl.innerHTML = '<p class="mono" style="font-size:11px;color:var(--ink-dim);">Chargement…</p>';
       staffEl.innerHTML = "";
       transferEl.innerHTML = "";
       zombieEl.innerHTML = "";
+      fogEl.innerHTML = "";
+      fogTeamEl.innerHTML = "";
+      fogSquadEl.innerHTML = "";
+      bonusEl.innerHTML = "";
+      bonusTeamEl.innerHTML = "";
+      bonusSquadEl.innerHTML = "";
 
       var players = await loadPlayers(cfg.code);
       var vis = await loadVisibility(cfg.code);
@@ -1903,6 +2053,167 @@
       Array.prototype.forEach.call(zombieEl.querySelectorAll(".zombie-toggle"), function(cb){
         cb.onchange = async function(){
           await setPlayerInfected(cfg.code, cb.dataset.pid, cb.checked);
+        };
+      });
+
+      // Applique (ou lève) le brouillard sur un lot de joueurs d'un coup (équipe/escouade).
+      async function applyFogToPids(matchingPids, minutes){
+        var until = Date.now() + minutes*60000;
+        for(var i=0; i<matchingPids.length; i++){
+          await upsertPlayer(cfg.code, matchingPids[i], { fogUntil: until });
+        }
+        loadRolesData();
+      }
+
+      var teamsForFog = cfg.teams.filter(function(t){ return t.name !== "Staff"; });
+      fogTeamEl.innerHTML = teamsForFog.length ? teamsForFog.map(function(t){
+        var count = pids.filter(function(pid){ return players[pid].team === t.name; }).length;
+        return '<div class="zone-row" style="flex-wrap:wrap;gap:6px;"><span class="name" style="color:'+t.color+'">● '+escapeHtml(t.name)+
+          ' <span class="mono" style="font-size:10px;color:var(--ink-dim);">· '+count+' joueur(s)</span></span>' +
+          '<input type="number" class="fog-team-minutes" data-team="'+escapeHtml(t.name)+'" value="5" min="1" style="width:58px;text-align:center;" />' +
+          '<button class="btn btn-sm btn-ghost fog-team-apply" data-team="'+escapeHtml(t.name)+'">Appliquer</button></div>';
+      }).join("") : '<p>Aucune équipe pour l\u2019instant.</p>';
+      Array.prototype.forEach.call(fogTeamEl.querySelectorAll(".fog-team-apply"), function(btn){
+        btn.onclick = function(){
+          var team = btn.dataset.team;
+          var input = btn.closest(".zone-row").querySelector(".fog-team-minutes");
+          var minutes = Math.max(1, parseInt(input && input.value, 10) || 5);
+          var matching = pids.filter(function(pid){ return players[pid].team === team; });
+          if(!matching.length) return;
+          if(!confirm("Appliquer le brouillard à toute l\u2019équipe "+team+" ("+matching.length+" joueur(s)) ?")) return;
+          applyFogToPids(matching, minutes);
+        };
+      });
+
+      var squadGroups = {};
+      pids.forEach(function(pid){
+        var p = players[pid];
+        var sq = (p.squad||"").trim();
+        if(!sq) return;
+        var key = (p.team||"") + " \u2014 " + sq;
+        if(!squadGroups[key]) squadGroups[key] = [];
+        squadGroups[key].push(pid);
+      });
+      var squadKeys = Object.keys(squadGroups);
+      fogSquadEl.innerHTML = squadKeys.length ? squadKeys.map(function(key){
+        return '<div class="zone-row" style="flex-wrap:wrap;gap:6px;"><span class="name">'+escapeHtml(key)+
+          ' <span class="mono" style="font-size:10px;color:var(--ink-dim);">· '+squadGroups[key].length+' joueur(s)</span></span>' +
+          '<input type="number" class="fog-squad-minutes" data-key="'+escapeHtml(key)+'" value="5" min="1" style="width:58px;text-align:center;" />' +
+          '<button class="btn btn-sm btn-ghost fog-squad-apply" data-key="'+escapeHtml(key)+'">Appliquer</button></div>';
+      }).join("") : '<p>Aucune escouade renseignée pour l\u2019instant (les joueurs la choisissent eux-mêmes en rejoignant).</p>';
+      Array.prototype.forEach.call(fogSquadEl.querySelectorAll(".fog-squad-apply"), function(btn){
+        btn.onclick = function(){
+          var key = btn.dataset.key;
+          var input = btn.closest(".zone-row").querySelector(".fog-squad-minutes");
+          var minutes = Math.max(1, parseInt(input && input.value, 10) || 5);
+          var matching = squadGroups[key] || [];
+          if(!matching.length) return;
+          if(!confirm("Appliquer le brouillard à l\u2019escouade \u00ab "+key+" \u00bb ("+matching.length+" joueur(s)) ?")) return;
+          applyFogToPids(matching, minutes);
+        };
+      });
+
+      fogEl.innerHTML = pids.map(function(pid){
+        var p = players[pid];
+        var active = p.fogUntil && p.fogUntil > Date.now();
+        if(active){
+          var remaining = Math.max(1, Math.ceil((p.fogUntil - Date.now())/60000));
+          return '<div class="zone-row"><span class="name">'+escapeHtml(p.name||"?")+
+            ' <span class="mono" style="font-size:10px;color:var(--amber);">· 🌫 encore ~'+remaining+' min</span></span>' +
+            '<button class="btn btn-sm btn-ghost fog-lift" data-pid="'+pid+'">Lever</button></div>';
+        }
+        return '<div class="zone-row" style="flex-wrap:wrap;gap:6px;"><span class="name">'+escapeHtml(p.name||"?")+
+          ' <span class="mono" style="font-size:10px;color:var(--ink-dim);"> · '+escapeHtml(p.team||"—")+'</span></span>' +
+          '<input type="number" class="fog-minutes" data-pid="'+pid+'" value="5" min="1" style="width:58px;text-align:center;" />' +
+          '<button class="btn btn-sm btn-ghost fog-apply" data-pid="'+pid+'">Appliquer</button></div>';
+      }).join("");
+      Array.prototype.forEach.call(fogEl.querySelectorAll(".fog-apply"), function(btn){
+        btn.onclick = async function(){
+          var pid = btn.dataset.pid;
+          var input = fogEl.querySelector('.fog-minutes[data-pid="'+pid+'"]');
+          var minutes = Math.max(1, parseInt(input && input.value, 10) || 5);
+          await upsertPlayer(cfg.code, pid, { fogUntil: Date.now() + minutes*60000 });
+          loadRolesData();
+        };
+      });
+      Array.prototype.forEach.call(fogEl.querySelectorAll(".fog-lift"), function(btn){
+        btn.onclick = async function(){
+          await upsertPlayer(cfg.code, btn.dataset.pid, { fogUntil: null });
+          loadRolesData();
+        };
+      });
+
+      // ---- 📡 Bonus radar (même mécanique que le brouillard, en positif) ----
+      async function applyBonusToPids(matchingPids, minutes){
+        var until = Date.now() + minutes*60000;
+        for(var i=0; i<matchingPids.length; i++){
+          await upsertPlayer(cfg.code, matchingPids[i], { radarBonusUntil: until });
+        }
+        loadRolesData();
+      }
+
+      bonusTeamEl.innerHTML = teamsForFog.length ? teamsForFog.map(function(t){
+        var count = pids.filter(function(pid){ return players[pid].team === t.name; }).length;
+        return '<div class="zone-row" style="flex-wrap:wrap;gap:6px;"><span class="name" style="color:'+t.color+'">● '+escapeHtml(t.name)+
+          ' <span class="mono" style="font-size:10px;color:var(--ink-dim);">· '+count+' joueur(s)</span></span>' +
+          '<input type="number" class="bonus-team-minutes" value="5" min="1" style="width:58px;text-align:center;" />' +
+          '<button class="btn btn-sm btn-ghost bonus-team-apply" data-team="'+escapeHtml(t.name)+'">Appliquer</button></div>';
+      }).join("") : '<p>Aucune équipe pour l\u2019instant.</p>';
+      Array.prototype.forEach.call(bonusTeamEl.querySelectorAll(".bonus-team-apply"), function(btn){
+        btn.onclick = function(){
+          var team = btn.dataset.team;
+          var input = btn.closest(".zone-row").querySelector(".bonus-team-minutes");
+          var minutes = Math.max(1, parseInt(input && input.value, 10) || 5);
+          var matching = pids.filter(function(pid){ return players[pid].team === team; });
+          if(!matching.length) return;
+          applyBonusToPids(matching, minutes);
+        };
+      });
+
+      bonusSquadEl.innerHTML = squadKeys.length ? squadKeys.map(function(key){
+        return '<div class="zone-row" style="flex-wrap:wrap;gap:6px;"><span class="name">'+escapeHtml(key)+
+          ' <span class="mono" style="font-size:10px;color:var(--ink-dim);">· '+squadGroups[key].length+' joueur(s)</span></span>' +
+          '<input type="number" class="bonus-squad-minutes" value="5" min="1" style="width:58px;text-align:center;" />' +
+          '<button class="btn btn-sm btn-ghost bonus-squad-apply" data-key="'+escapeHtml(key)+'">Appliquer</button></div>';
+      }).join("") : '<p>Aucune escouade renseignée pour l\u2019instant.</p>';
+      Array.prototype.forEach.call(bonusSquadEl.querySelectorAll(".bonus-squad-apply"), function(btn){
+        btn.onclick = function(){
+          var key = btn.dataset.key;
+          var input = btn.closest(".zone-row").querySelector(".bonus-squad-minutes");
+          var minutes = Math.max(1, parseInt(input && input.value, 10) || 5);
+          var matching = squadGroups[key] || [];
+          if(!matching.length) return;
+          applyBonusToPids(matching, minutes);
+        };
+      });
+
+      bonusEl.innerHTML = pids.map(function(pid){
+        var p = players[pid];
+        var active = p.radarBonusUntil && p.radarBonusUntil > Date.now();
+        if(active){
+          var remaining = Math.max(1, Math.ceil((p.radarBonusUntil - Date.now())/60000));
+          return '<div class="zone-row"><span class="name">'+escapeHtml(p.name||"?")+
+            ' <span class="mono" style="font-size:10px;color:var(--amber);">· 📡 encore ~'+remaining+' min</span></span>' +
+            '<button class="btn btn-sm btn-ghost bonus-lift" data-pid="'+pid+'">Retirer</button></div>';
+        }
+        return '<div class="zone-row" style="flex-wrap:wrap;gap:6px;"><span class="name">'+escapeHtml(p.name||"?")+
+          ' <span class="mono" style="font-size:10px;color:var(--ink-dim);"> · '+escapeHtml(p.team||"—")+'</span></span>' +
+          '<input type="number" class="bonus-minutes" data-pid="'+pid+'" value="5" min="1" style="width:58px;text-align:center;" />' +
+          '<button class="btn btn-sm btn-ghost bonus-apply" data-pid="'+pid+'">Appliquer</button></div>';
+      }).join("");
+      Array.prototype.forEach.call(bonusEl.querySelectorAll(".bonus-apply"), function(btn){
+        btn.onclick = async function(){
+          var pid = btn.dataset.pid;
+          var input = bonusEl.querySelector('.bonus-minutes[data-pid="'+pid+'"]');
+          var minutes = Math.max(1, parseInt(input && input.value, 10) || 5);
+          await upsertPlayer(cfg.code, pid, { radarBonusUntil: Date.now() + minutes*60000 });
+          loadRolesData();
+        };
+      });
+      Array.prototype.forEach.call(bonusEl.querySelectorAll(".bonus-lift"), function(btn){
+        btn.onclick = async function(){
+          await upsertPlayer(cfg.code, btn.dataset.pid, { radarBonusUntil: null });
+          loadRolesData();
         };
       });
     }
@@ -2192,9 +2503,10 @@
     var cfg = state.event;
     app.innerHTML =
       '<div class="topbar"><button class="back">‹ Quitter</button><div class="eyebrow">'+escapeHtml(cfg.name)+' · '+cfg.code+'</div></div>' +
-      '<div class="map-rotate-wrapper" id="map-wrapper"><div id="map"></div><button class="map-fullscreen-btn" id="btn-fullscreen-map" title="Plein écran">⛶</button><div id="warzone-banner" class="warzone-banner-overlay"></div></div>' +
+      '<div class="map-rotate-wrapper" id="map-wrapper"><div id="map"></div><button class="map-fullscreen-btn" id="btn-fullscreen-map" title="Plein écran">⛶</button><div class="warzone-banner-overlay"><div id="warzone-banner"></div><div id="fog-banner"></div><div id="radar-bonus-banner"></div></div></div>' +
       '<div class="status-bar"><span class="status-dot" id="status-dot"></span><span id="status-text">Initialisation…</span></div>' +
       '<p id="zone-danger-note" class="mono" style="font-size:11px;color:#f2a89a;margin-top:4px;"></p>' +
+      '<p id="offline-indicator" class="mono" style="font-size:11px;color:var(--amber);margin-top:4px;display:none;"></p>' +
       '<div class="zone-legend">' +
         ZONE_STATUSES.map(function(s){ return '<span><span class="dot" style="background:'+s.color+'"></span> '+s.label+'</span>'; }).join("") +
       '</div>' +
@@ -2209,11 +2521,16 @@
         '<input type="checkbox" id="test-mode" '+(state.testMode?'checked':'')+' /></div>' +
       (state.player.squad ? '<div class="test-toggle"><span class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">Mon escouade seulement ('+escapeHtml(state.player.squad)+')</span>' +
         '<input type="checkbox" id="squad-only-toggle" '+(state.squadOnly?'checked':'')+' /></div>' : '') +
+      '<div class="test-toggle"><span class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">🔋 Économie de batterie</span>' +
+        '<input type="checkbox" id="battery-saver-toggle" '+(state.batterySaverMode?'checked':'')+' /></div>' +
+      '<p id="refresh-rate-note" class="mono" style="font-size:10px;color:var(--ink-dim);margin-top:2px;"></p>' +
       '<div id="geo-banner"></div>' +
       '<p class="mono" id="vis-note" style="font-size:11px;color:var(--amber);margin-top:6px;"></p>' +
       '<div class="row" style="margin-top:10px;">' +
         '<button class="btn btn-sm '+(state.player.sos?'btn-danger':'btn-ghost')+'" id="btn-sos">'+(state.player.sos?'🆘 Annuler la demande d\u2019aide':'🆘 Demander de l\u2019aide')+'</button>' +
+        '<button class="btn btn-sm btn-ghost" id="btn-ping-menu">📍 Ping</button>' +
       '</div>' +
+      '<div id="ping-menu"></div>' +
       '<div id="staff-actions"></div>' +
       '<div id="claim-admin"></div>' +
       '<div class="field" style="margin-top:12px;"><input type="text" id="roster-search" placeholder="Rechercher un joueur…" value="'+escapeHtml(state.rosterSearch)+'" /></div>' +
@@ -2246,6 +2563,10 @@
     };
     var squadToggle = document.getElementById("squad-only-toggle");
     if(squadToggle) squadToggle.onchange = function(e){ state.squadOnly = e.target.checked; refreshPlayers(); };
+    document.getElementById("battery-saver-toggle").onchange = function(e){
+      state.batterySaverMode = e.target.checked;
+      restartPolling();
+    };
     document.getElementById("roster-search").oninput = function(e){ state.rosterSearch = e.target.value; refreshPlayers(); };
     document.getElementById("btn-sos").onclick = async function(){
       state.player.sos = !state.player.sos;
@@ -2258,18 +2579,40 @@
       }
     };
 
+    document.getElementById("btn-ping-menu").onclick = function(){
+      var el = document.getElementById("ping-menu");
+      if(el.dataset.open === "1"){ el.innerHTML = ""; el.dataset.open = ""; return; }
+      el.dataset.open = "1";
+      el.innerHTML = '<div class="ping-grid">' +
+        PING_KINDS.map(function(k){
+          return '<button class="btn btn-sm btn-ghost ping-btn" data-kind="'+k.kind+'">'+k.emoji+' '+escapeHtml(k.label)+'</button>';
+        }).join("") +
+      '</div>';
+      Array.prototype.forEach.call(el.querySelectorAll(".ping-btn"), function(btn){
+        btn.onclick = async function(){
+          if(!state.lastCoords){
+            el.innerHTML = '<p style="font-size:11px;color:var(--amber);">Position pas encore connue — attends le signal GPS.</p>';
+            return;
+          }
+          var kindDef = PING_KINDS.filter(function(k){ return k.kind === btn.dataset.kind; })[0];
+          if(kindDef && state.event) await addPing(state.event.code, kindDef, state.lastCoords.lat, state.lastCoords.lng);
+          el.innerHTML = "";
+          el.dataset.open = "";
+          refreshPings();
+        };
+      });
+    };
+
     if(!LIBS_OK.leaflet){
       document.getElementById("map").outerHTML = '<div class="banner warn">La carte n\'a pas pu se charger (librairie indisponible). Vérifie ta connexion.</div>';
       return;
     }
 
     var map = L.map('map', { zoomControl: true }).setView([cfg.center.lat, cfg.center.lng], cfg.zoom || 17);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      maxZoom: 19,
-      attribution: '&copy; OpenStreetMap'
-    }).addTo(map);
+    createCachedTileLayer().addTo(map);
     state.map = map;
     map.on('zoomend', applyLabelZoomVisibility);
+    map.on('zoomend moveend', updateMarkerClusters);
     applyLabelZoomVisibility();
     applyCompassRotation();
     setupMapRotateGesture(document.getElementById("map"));
@@ -2286,23 +2629,97 @@
     });
 
     applyGeoMode();
+    setupBatteryAwareness();
 
-    // Écrit la position toutes les 4s (throttle), et rafraîchit joueurs + bâtiments toutes les 4s
-    state.writeTimer = setInterval(writePositionNow, 4000);
-    state.pollTimer = setInterval(function(){ refreshPlayers(); refreshZones(); }, 4000);
+    // Écrit la position et rafraîchit joueurs + bâtiments, au rythme calculé selon la
+    // batterie (ou le mode économie choisi par le joueur) — voir restartPolling().
+    restartPolling();
     refreshPlayers();
     refreshZones();
+    refreshPings();
     startWarzoneTicker();
+  }
+
+  // ---------- Rafraîchissement adapté à la batterie ----------
+  // Le GPS + les échanges réseau réguliers consomment de la batterie. On ralentit
+  // automatiquement la fréquence quand la batterie baisse (si le navigateur expose
+  // cette info — Android/Chrome seulement, iPhone n'a pas cette API), et le joueur
+  // garde la main via le bouton "Économie de batterie" quel que soit l'appareil.
+  function getPollInterval(){
+    if(state.batterySaverMode) return 10000;
+    var lvl = state.batteryLevel; // 0-1, ou null si inconnu
+    if(lvl === null || lvl === undefined) return 4000; // valeur d'origine si l'info n'est pas dispo
+    if(lvl > 0.5) return 3000;
+    if(lvl > 0.25) return 6000;
+    return 10000;
+  }
+  function updateRefreshRateNote(){
+    var el = document.getElementById("refresh-rate-note");
+    if(!el) return;
+    var ms = getPollInterval();
+    var secs = Math.round(ms/1000);
+    var batteryTxt = (state.batteryLevel !== null && state.batteryLevel !== undefined)
+      ? (" · batterie " + Math.round(state.batteryLevel*100) + "%") : "";
+    el.textContent = "Rafraîchissement toutes les " + secs + "s" + batteryTxt;
+  }
+  function restartPolling(){
+    if(state.writeTimer){ clearInterval(state.writeTimer); state.writeTimer = null; }
+    if(state.pollTimer){ clearInterval(state.pollTimer); state.pollTimer = null; }
+    var interval = getPollInterval();
+    state.writeTimer = setInterval(writePositionNow, interval);
+    state.pollTimer = setInterval(function(){ refreshPlayers(); refreshZones(); refreshPings(); }, interval);
+    updateRefreshRateNote();
+  }
+  function setupBatteryAwareness(){
+    if(state.batteryWatched) { updateRefreshRateNote(); return; }
+    state.batteryWatched = true;
+    if(!navigator.getBattery){ updateRefreshRateNote(); return; }
+    navigator.getBattery().then(function(battery){
+      state.batteryLevel = battery.level;
+      restartPolling();
+      battery.addEventListener("levelchange", function(){
+        state.batteryLevel = battery.level;
+        restartPolling();
+      });
+    }).catch(function(){ updateRefreshRateNote(); });
   }
 
   // Fait défiler le compte à rebours des zones de guerre seconde par seconde, à partir des
   // données déjà en cache — pas besoin d'interroger le réseau plus souvent pour ça.
   function startWarzoneTicker(){
     if(state.warzoneTickTimer) return;
-    state.warzoneTickTimer = setInterval(function(){ updateWarzoneBanner(state.cachedZones); }, 1000);
+    state.warzoneTickTimer = setInterval(function(){ updateWarzoneBanner(state.cachedZones); updateFogBanner(); updateRadarBonusBanner(); }, 1000);
   }
   function stopWarzoneTicker(){
     if(state.warzoneTickTimer){ clearInterval(state.warzoneTickTimer); state.warzoneTickTimer = null; }
+  }
+
+  // Bandeau clair pour le joueur sanctionné : sans ça, l'absence soudaine des autres
+  // joueurs sur sa carte ressemblerait à un bug plutôt qu'à une sanction assumée.
+  function updateFogBanner(){
+    var el = document.getElementById("fog-banner");
+    if(!el) return;
+    if(!state.fogUntil || state.fogUntil <= Date.now()){ el.innerHTML = ""; return; }
+    var remaining = Math.max(0, state.fogUntil - Date.now());
+    var mm = Math.floor(remaining/60000);
+    var ss = Math.floor((remaining%60000)/1000);
+    el.innerHTML = '<div class="warzone-alert active">' +
+      '<div class="wz-name">🌫 Brouillard actif</div>' +
+      '<div class="wz-time">Radar coupé — ' + mm + ':' + ("0"+ss).slice(-2) + ' restantes</div>' +
+    '</div>';
+  }
+
+  function updateRadarBonusBanner(){
+    var el = document.getElementById("radar-bonus-banner");
+    if(!el) return;
+    if(!state.radarBonusUntil || state.radarBonusUntil <= Date.now()){ el.innerHTML = ""; return; }
+    var remaining = Math.max(0, state.radarBonusUntil - Date.now());
+    var mm = Math.floor(remaining/60000);
+    var ss = Math.floor((remaining%60000)/1000);
+    el.innerHTML = '<div class="warzone-alert pending">' +
+      '<div class="wz-name">📡 Bonus radar actif</div>' +
+      '<div class="wz-time">Vision élargie — ' + mm + ':' + ("0"+ss).slice(-2) + ' restantes</div>' +
+    '</div>';
   }
 
   // ---------- Rotation manuelle de la carte (cadran + geste à deux doigts, façon Google Maps) ----------
@@ -2562,8 +2979,21 @@
 
   async function refreshPlayers(){
     if(!state.event) return;
+    state.networkOk = true;
     var players = await loadPlayers(state.event.code);
     var vis = await loadVisibility(state.event.code);
+
+    if(!state.networkOk){
+      // Coupure réseau : on retombe sur la dernière image connue (localStorage) plutôt
+      // que d'afficher une carte vidée, le temps que la connexion revienne.
+      var cached = loadOfflineCache(state.event.code);
+      if(cached){ players = cached.players || {}; vis = cached.vis || vis; }
+      setOfflineIndicator(true, cached ? cached.ts : null);
+    } else {
+      setOfflineIndicator(false);
+      saveOfflineCache(state.event.code, { players: players, vis: vis, ts: Date.now() });
+    }
+
     if(vis.adminId && players[vis.adminId]) players[vis.adminId].isAdmin = true;
 
     // Statut admin/staff recalculé à chaque cycle (transfert possible en cours de partie)
@@ -2587,7 +3017,10 @@
 
     var amPrivileged = state.isOrganizer || amStaff;
     var teamRevealed = myTeam && vis.revealedTeams.indexOf(myTeam) !== -1;
-    var restricted = !amPrivileged && !teamRevealed;
+    var myBonusUntil = me && me.radarBonusUntil;
+    var myBonus = !!(myBonusUntil && myBonusUntil > Date.now());
+    state.radarBonusUntil = myBonus ? myBonusUntil : null;
+    var restricted = !amPrivileged && !teamRevealed && !myBonus;
 
     var visible = {};
     Object.keys(players).forEach(function(pid){
@@ -2611,6 +3044,19 @@
       });
     }
 
+    // 🌫 Brouillard : punition temporaire décidée par l'organisateur — coupe le radar
+    // du joueur concerné (il ne voit plus que lui-même), sans toucher au reste (terrain,
+    // zones). Prioritaire sur toutes les autres règles de visibilité.
+    var myFogUntil = me && me.fogUntil;
+    var fogged = !!(myFogUntil && myFogUntil > Date.now());
+    state.fogUntil = fogged ? myFogUntil : null;
+    if(fogged){
+      visible = {};
+      visible[state.playerId] = me;
+    }
+    updateFogBanner();
+    updateRadarBonusBanner();
+
     var note = document.getElementById("vis-note");
     if(note) note.textContent = restricted ? "Vision limitée à ton équipe (sauf déblocage par le staff)." : "";
 
@@ -2620,10 +3066,73 @@
 
   async function refreshZones(){
     if(!state.event) return;
+    state.networkOk = true;
     var zones = await loadZones(state.event.code);
+    if(!state.networkOk){
+      var cached = loadOfflineCache(state.event.code);
+      if(cached && cached.zones) zones = cached.zones;
+    } else {
+      var existing = loadOfflineCache(state.event.code) || {};
+      saveOfflineCache(state.event.code, Object.assign({}, existing, { zones: zones, ts: Date.now() }));
+    }
     state.cachedZones = zones;
     updateZonePolygons(zones);
     updateWarzoneBanner(zones);
+  }
+
+  // ---------- Repli hors-ligne : dernière image connue (joueurs, zones, visibilité) ----------
+  function offlineCacheKey(code){ return "badRecon_offline_" + code; }
+  function loadOfflineCache(code){
+    try{
+      var raw = localStorage.getItem(offlineCacheKey(code));
+      return raw ? JSON.parse(raw) : null;
+    }catch(e){ return null; }
+  }
+  function saveOfflineCache(code, data){
+    try{ localStorage.setItem(offlineCacheKey(code), JSON.stringify(data)); }catch(e){}
+  }
+  function setOfflineIndicator(isOffline, lastTs){
+    var el = document.getElementById("offline-indicator");
+    if(!el) return;
+    if(!isOffline){ el.textContent = ""; el.style.display = "none"; return; }
+    el.style.display = "block";
+    var when = "";
+    if(lastTs){
+      var d = new Date(lastTs);
+      when = " — dernières données à " + ("0"+d.getHours()).slice(-2) + ":" + ("0"+d.getMinutes()).slice(-2);
+    }
+    el.textContent = "📡 Hors ligne" + when + " — reconnexion en cours…";
+  }
+
+  // ---------- Rendu des pings temporaires sur la carte ----------
+  async function refreshPings(){
+    if(!state.event || !state.map) return;
+    if(state.fogUntil && state.fogUntil > Date.now()){ renderPingMarkers([]); return; }
+    var pings = await loadPings(state.event.code);
+    var now = Date.now();
+    pings = pings.filter(function(p){ return (now - p.ts) < PING_DURATION_MS; });
+    state.cachedPings = pings;
+    renderPingMarkers(pings);
+  }
+  function renderPingMarkers(pings){
+    if(!state.map) return;
+    if(!state.pingMarkers) state.pingMarkers = {};
+    var seen = {};
+    pings.forEach(function(p){
+      seen[p.id] = true;
+      if(state.pingMarkers[p.id]) return; // déjà affiché
+      var icon = L.divIcon({ html:'<div class="ping-marker">'+p.emoji+'</div>', className:'', iconSize:[26,26], iconAnchor:[13,13] });
+      var marker = L.marker([p.lat, p.lng], { icon: icon }).addTo(state.map);
+      marker.on('click', function(){
+        var secsLeft = Math.max(0, Math.round((PING_DURATION_MS - (Date.now()-p.ts))/1000));
+        marker.bindPopup(escapeHtml(p.label) + ' — ' + escapeHtml(p.playerName) + '<br/><span style="font-size:11px;">disparaît dans ' + secsLeft + 's</span>').openPopup();
+      });
+      state.pingMarkers[p.id] = marker;
+    });
+    // retire les marqueurs des pings expirés / disparus
+    Object.keys(state.pingMarkers).forEach(function(id){
+      if(!seen[id]){ state.map.removeLayer(state.pingMarkers[id]); delete state.pingMarkers[id]; }
+    });
   }
 
   function updateWarzoneBanner(zones){
@@ -2774,6 +3283,54 @@
       if(!seen[pid]){ state.map.removeLayer(state.markers[pid]); delete state.markers[pid]; }
     });
     applyLabelZoomVisibility();
+    updateMarkerClusters();
+  }
+
+  // ---------- Regroupement des marqueurs trop proches à l'écran (badge avec compteur) ----------
+  function updateMarkerClusters(){
+    if(!state.map) return;
+    var THRESHOLD_PX = 24;
+    var ids = Object.keys(state.markers);
+    var points = ids.map(function(pid){
+      var m = state.markers[pid];
+      return { pid: pid, marker: m, pt: state.map.latLngToContainerPoint(m.getLatLng()) };
+    });
+    var assigned = {};
+    var groups = [];
+    points.forEach(function(a){
+      if(assigned[a.pid]) return;
+      var group = [a];
+      assigned[a.pid] = true;
+      points.forEach(function(b){
+        if(assigned[b.pid]) return;
+        var dx = a.pt.x - b.pt.x, dy = a.pt.y - b.pt.y;
+        if(Math.sqrt(dx*dx + dy*dy) < THRESHOLD_PX){ group.push(b); assigned[b.pid] = true; }
+      });
+      groups.push(group);
+    });
+
+    if(state.clusterMarkers){
+      state.clusterMarkers.forEach(function(cm){ state.map.removeLayer(cm); });
+    }
+    state.clusterMarkers = [];
+
+    groups.forEach(function(group){
+      if(group.length === 1){
+        if(!state.map.hasLayer(group[0].marker)) group[0].marker.addTo(state.map);
+        return;
+      }
+      group.forEach(function(g){ if(state.map.hasLayer(g.marker)) state.map.removeLayer(g.marker); });
+      var latlngs = group.map(function(g){ return g.marker.getLatLng(); });
+      var centerLat = latlngs.reduce(function(s,l){ return s+l.lat; }, 0) / latlngs.length;
+      var centerLng = latlngs.reduce(function(s,l){ return s+l.lng; }, 0) / latlngs.length;
+      var icon = L.divIcon({ html:'<div class="cluster-badge">'+group.length+'</div>', className:'', iconSize:[28,28], iconAnchor:[14,14] });
+      var badge = L.marker([centerLat, centerLng], { icon: icon }).addTo(state.map);
+      badge.on('click', function(){
+        var names = group.map(function(g){ return escapeHtml(g.marker._lastName || "?"); }).join('<br/>');
+        badge.bindPopup('<strong>'+group.length+' joueurs ici :</strong><br/>'+names).openPopup();
+      });
+      state.clusterMarkers.push(badge);
+    });
   }
 
   function applyLabelZoomVisibility(){
@@ -2828,6 +3385,10 @@
     if(state.map){ state.map.remove(); state.map = null; }
     state.markers = {};
     state.zonesLayers = {};
+    state.pingMarkers = {};
+    state.clusterMarkers = [];
+    state.fogUntil = null;
+    state.radarBonusUntil = null;
   }
 
   // Quand l'appli est vraiment fermée (onglet fermé, appli quittée) : on arrête le GPS et les
