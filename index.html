@@ -220,6 +220,8 @@
   .warzone-alert.active{ border-color:var(--danger); background:rgba(35,15,12,0.85); color:#f2a89a; animation: warzoneflash 1.6s ease-in-out infinite; }
   .warzone-alert .wz-name{ font-family:'JetBrains Mono',monospace; font-size:10px; text-transform:uppercase; letter-spacing:.05em; opacity:.85; }
   .warzone-alert .wz-time{ font-size:20px; font-weight:700; margin-top:2px; }
+  .flag-progress-track{ width:100%; height:5px; border-radius:3px; background:rgba(231,221,201,.18); margin-top:6px; overflow:hidden; }
+  .flag-progress-fill{ height:100%; background:var(--amber); border-radius:3px; transition:width .4s ease-out; }
   @keyframes warzoneflash{ 0%,100%{ opacity:1; } 50%{ opacity:.55; } }
   .zone-legend .dot{ width:8px; height:8px; }
   .leaflet-interactive.zone-objectif{ animation: zonepulse 1.6s ease-in-out infinite; }
@@ -415,6 +417,12 @@
     editorWatchId: null,
     editingZoneId: null,   // zone en cours de modification (poignées visibles) dans l'éditeur
     editorMeMarker: null,
+    refImageDataUrl: null,
+    refImageCorners: null,
+    refImageRotation: 0,
+    refImageOpacity: 0.6,
+    refImagePlacing: false,
+    refImageOverlayEl: null,
     cachedZones: [],
     modAuthed: false,
     batteryLevel: null,
@@ -559,8 +567,44 @@
     }catch(e){ return false; }
   }
 
+  // ---------- Stockage "brut" (un seul encodage JSON, pas de double encodage) ----------
+  // storageGet/storageSet ci-dessus encodent la valeur en texte AVANT de l'envoyer (l'appelant
+  // fait déjà JSON.stringify, puis storageSet le refait) : Firebase stocke donc chaque clé comme
+  // un simple bloc de texte, jamais comme une vraie arborescence — impossible d'adresser un
+  // enfant précis (ex. un seul joueur) sans retélécharger et réécrire tout le bloc. Ces fonctions
+  // envoient l'objet tel quel : Firebase le stocke alors comme une vraie arborescence, où chaque
+  // joueur devient un nœud à part entière qu'on peut lire/écrire individuellement.
+  async function rawStorageGet(key){
+    if(!dbConfigured()) return null;
+    try{
+      var res = await fetch(FIREBASE_DB_URL + "/" + key + ".json");
+      state.networkOk = true;
+      if(!res.ok) return null;
+      return await res.json();
+    }catch(e){ state.networkOk = false; return null; }
+  }
+  async function rawStorageSet(key, value){
+    if(!dbConfigured()) return false;
+    try{
+      var res = await fetch(FIREBASE_DB_URL + "/" + key + ".json", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(value)
+      });
+      return res.ok;
+    }catch(e){ return false; }
+  }
+  async function rawStorageDelete(key){
+    if(!dbConfigured()) return false;
+    try{
+      var res = await fetch(FIREBASE_DB_URL + "/" + key + ".json", { method: "DELETE" });
+      return res.ok;
+    }catch(e){ return false; }
+  }
+
   function eventConfigKey(code){ return "event:" + code + ":config"; }
   function eventPlayersKey(code){ return "event:" + code + ":players"; }
+  function eventPlayerKey(code, playerId){ return eventPlayersKey(code) + "/" + playerId; }
   function eventLogKey(code){ return "event:" + code + ":log"; }
   async function loadEventLog(code){
     var raw = await storageGet(eventLogKey(code));
@@ -613,19 +657,20 @@
     return storageSet(eventConfigKey(cfg.code), JSON.stringify(cfg));
   }
   async function loadPlayers(code){
-    var raw = await storageGet(eventPlayersKey(code));
-    if(!raw) return {};
-    try{ return JSON.parse(raw); }catch(e){ return {}; }
+    // Une seule lecture pour TOUS les joueurs reste nécessaire ici (la carte a besoin de
+    // connaître tout le monde) — ce qui change, c'est l'ÉCRITURE : elle ne touche plus que
+    // le joueur concerné (voir upsertPlayer), au lieu de retélécharger puis réécrire ce
+    // même bloc complet à chaque battement de position de chaque joueur.
+    var data = await rawStorageGet(eventPlayersKey(code));
+    return data || {};
   }
   async function upsertPlayer(code, playerId, data){
-    var players = await loadPlayers(code);
-    players[playerId] = Object.assign({}, players[playerId] || {}, data, { ts: Date.now() });
-    await storageSet(eventPlayersKey(code), JSON.stringify(players));
+    var existing = await rawStorageGet(eventPlayerKey(code, playerId));
+    var merged = Object.assign({}, existing || {}, data, { ts: Date.now() });
+    await rawStorageSet(eventPlayerKey(code, playerId), merged);
   }
   async function deletePlayer(code, playerId){
-    var players = await loadPlayers(code);
-    delete players[playerId];
-    return storageSet(eventPlayersKey(code), JSON.stringify(players));
+    return rawStorageDelete(eventPlayerKey(code, playerId));
   }
   async function mergeDuplicatePlayers(code){
     var players = await loadPlayers(code);
@@ -638,13 +683,16 @@
       byName[key].push({ pid: pid, ts: p.ts||0 });
     });
     var removed = 0;
+    var deletions = [];
     Object.keys(byName).forEach(function(key){
       var group = byName[key];
       if(group.length < 2) return;
       group.sort(function(a,b){ return b.ts - a.ts; });
-      for(var i=1;i<group.length;i++){ delete players[group[i].pid]; removed++; }
+      for(var i=1;i<group.length;i++){ deletions.push(group[i].pid); removed++; }
     });
-    if(removed) await storageSet(eventPlayersKey(code), JSON.stringify(players));
+    // Chaque doublon est supprimé individuellement (son propre nœud), sans toucher aux
+    // joueurs qui n'ont rien à voir avec la fusion.
+    for(var j=0;j<deletions.length;j++){ await deletePlayer(code, deletions[j]); }
     return removed;
   }
 
@@ -770,14 +818,14 @@
   async function setPlayerRole(code, playerId, role){
     var players = await loadPlayers(code);
     if(!players[playerId]) return false;
-    players[playerId].role = role;
-    return storageSet(eventPlayersKey(code), JSON.stringify(players));
+    await upsertPlayer(code, playerId, { role: role });
+    return true;
   }
   async function setPlayerInfected(code, playerId, infected){
     var players = await loadPlayers(code);
     if(!players[playerId]) return false;
-    players[playerId].infected = infected;
-    return storageSet(eventPlayersKey(code), JSON.stringify(players));
+    await upsertPlayer(code, playerId, { infected: infected });
+    return true;
   }
 
   // ---------- Utilitaires ----------
@@ -1336,6 +1384,11 @@
         '<button class="btn btn-sm btn-ghost" id="btn-load-map">Charger une carte</button>' +
         '<button class="btn btn-sm btn-ghost" id="btn-save-map">Enregistrer comme modèle</button>' +
       '</div>' +
+      '<div class="panel" style="margin-top:14px;">' +
+        '<label class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">🖼️ Image de référence (aide au tracé)</label>' +
+        '<p style="margin-top:4px;">Superpose un plan existant (PDF exporté en image, photo drone, plan à main levée…) sur la carte pour tracer par-dessus plus précisément. Reste sur ton téléphone, pas envoyée aux autres joueurs.</p>' +
+        '<div id="ref-image-controls" style="margin-top:8px;"></div>' +
+      '</div>' +
       '<div id="editor-banner"></div>' +
       (state.editorMode === "draft" ? '<div class="stack" style="margin-top:14px;"><button class="btn btn-primary" id="btn-editor-done">Valider</button></div>' : '');
 
@@ -1360,8 +1413,14 @@
     drawExistingZones();
     drawToolbar();
     drawZoneList();
+    renderRefImageControls();
+    map.on('move zoom', updateRefImageOverlayPosition);
 
     map.on('click', function(e){
+      if(state.refImagePlacing){
+        handleRefImageCornerTap([e.latlng.lat, e.latlng.lng]);
+        return;
+      }
       if(state.placingPoint){
         openPointForm([e.latlng.lat, e.latlng.lng]);
         return;
@@ -1415,6 +1474,127 @@
     state.editorMeMarker = null;
   }
 
+  // ---------- Image de référence superposée (aide au tracé, locale au téléphone) ----------
+  // Ne quitte jamais l'appareil : ni enregistrée sur Firebase, ni envoyée aux autres joueurs.
+  // Sert uniquement à caler visuellement les tracés (bâtiments, murs, drapeaux…) sur un plan
+  // existant (PDF exporté en image, photo drone, plan à main levée…) pendant l'édition.
+  function updateRefImageOverlayPosition(){
+    if(!state.editorMap || !state.refImageCorners || state.refImageCorners.length < 2 || !state.refImageOverlayEl) return;
+    var map = state.editorMap;
+    var p1 = map.latLngToContainerPoint(state.refImageCorners[0]);
+    var p2 = map.latLngToContainerPoint(state.refImageCorners[1]);
+    var left = Math.min(p1.x, p2.x), top = Math.min(p1.y, p2.y);
+    var width = Math.abs(p2.x - p1.x), height = Math.abs(p2.y - p1.y);
+    var el = state.refImageOverlayEl;
+    el.style.left = left + "px";
+    el.style.top = top + "px";
+    el.style.width = width + "px";
+    el.style.height = height + "px";
+    el.style.transform = "rotate(" + (state.refImageRotation||0) + "deg)";
+  }
+
+  function createRefImageOverlay(){
+    if(!state.editorMap || !state.refImageDataUrl) return;
+    if(state.refImageOverlayEl && state.refImageOverlayEl.parentNode){ state.refImageOverlayEl.parentNode.removeChild(state.refImageOverlayEl); }
+    var el = document.createElement("img");
+    el.src = state.refImageDataUrl;
+    el.style.position = "absolute";
+    el.style.left = "0px"; el.style.top = "0px";
+    el.style.zIndex = "350"; // au-dessus des tuiles (≈200), en dessous des zones/marqueurs (≈400+)
+    el.style.pointerEvents = "none";
+    el.style.opacity = state.refImageOpacity;
+    el.style.transformOrigin = "center center";
+    state.editorMap.getContainer().appendChild(el);
+    state.refImageOverlayEl = el;
+    updateRefImageOverlayPosition();
+  }
+
+  function handleRefImageCornerTap(latlng){
+    if(!state.refImageCorners) state.refImageCorners = [];
+    state.refImageCorners.push(latlng);
+    if(state.refImageCorners.length >= 2){
+      state.refImagePlacing = false;
+      createRefImageOverlay();
+    }
+    renderRefImageControls();
+  }
+
+  function renderRefImageControls(){
+    var el = document.getElementById("ref-image-controls");
+    if(!el) return;
+
+    if(!state.refImageDataUrl){
+      el.innerHTML =
+        '<input type="file" accept="image/*" id="ref-image-file" style="display:none;" />' +
+        '<button class="btn btn-sm btn-ghost" id="btn-ref-image-pick">Choisir une image</button>';
+      document.getElementById("btn-ref-image-pick").onclick = function(){
+        document.getElementById("ref-image-file").click();
+      };
+      document.getElementById("ref-image-file").onchange = function(e){
+        var file = e.target.files && e.target.files[0];
+        if(!file) return;
+        var reader = new FileReader();
+        reader.onload = function(ev){
+          state.refImageDataUrl = ev.target.result;
+          state.refImageCorners = [];
+          state.refImagePlacing = true;
+          renderRefImageControls();
+        };
+        reader.readAsDataURL(file);
+      };
+      return;
+    }
+
+    if(state.refImagePlacing){
+      var n = (state.refImageCorners||[]).length;
+      el.innerHTML =
+        '<p class="mono" style="font-size:11px;color:var(--ink-dim);">Touche 2 points sur la carte : le coin haut-gauche de l\u2019image, puis son coin bas-droit. ('+n+'/2)</p>' +
+        '<button class="btn btn-sm btn-ghost" id="btn-ref-image-cancel">Annuler</button>';
+      document.getElementById("btn-ref-image-cancel").onclick = function(){
+        state.refImageDataUrl = null; state.refImageCorners = null; state.refImagePlacing = false;
+        renderRefImageControls();
+      };
+      return;
+    }
+
+    el.innerHTML =
+      '<div class="field" style="margin-top:0;"><label id="ref-image-rot-label">Rotation ('+Math.round(state.refImageRotation)+'\u00b0)</label>' +
+        '<input type="range" id="ref-image-rotation" min="0" max="359" value="'+Math.round(state.refImageRotation)+'" /></div>' +
+      '<div class="field"><label id="ref-image-op-label">Opacit\u00e9 ('+Math.round(state.refImageOpacity*100)+'%)</label>' +
+        '<input type="range" id="ref-image-opacity" min="10" max="100" value="'+Math.round(state.refImageOpacity*100)+'" /></div>' +
+      '<div class="row" style="margin-top:8px;">' +
+        '<button class="btn btn-sm btn-ghost" id="btn-ref-image-reposition">Repositionner les coins</button>' +
+        '<button class="btn btn-sm btn-ghost" id="btn-ref-image-remove">Retirer l\u2019image</button>' +
+      '</div>';
+    document.getElementById("ref-image-rotation").oninput = function(e){
+      state.refImageRotation = parseInt(e.target.value, 10) || 0;
+      updateRefImageOverlayPosition();
+      var lbl = document.getElementById("ref-image-rot-label");
+      if(lbl) lbl.textContent = "Rotation (" + state.refImageRotation + "\u00b0)";
+    };
+    document.getElementById("ref-image-opacity").oninput = function(e){
+      state.refImageOpacity = (parseInt(e.target.value, 10) || 10) / 100;
+      if(state.refImageOverlayEl) state.refImageOverlayEl.style.opacity = state.refImageOpacity;
+      var lbl = document.getElementById("ref-image-op-label");
+      if(lbl) lbl.textContent = "Opacit\u00e9 (" + Math.round(state.refImageOpacity*100) + "%)";
+    };
+    document.getElementById("btn-ref-image-reposition").onclick = function(){
+      if(state.refImageOverlayEl && state.refImageOverlayEl.parentNode){ state.refImageOverlayEl.parentNode.removeChild(state.refImageOverlayEl); }
+      state.refImageOverlayEl = null;
+      state.refImageCorners = [];
+      state.refImagePlacing = true;
+      renderRefImageControls();
+    };
+    document.getElementById("btn-ref-image-remove").onclick = function(){
+      if(state.refImageOverlayEl && state.refImageOverlayEl.parentNode){ state.refImageOverlayEl.parentNode.removeChild(state.refImageOverlayEl); }
+      state.refImageOverlayEl = null;
+      state.refImageDataUrl = null;
+      state.refImageCorners = null;
+      state.refImageRotation = 0;
+      renderRefImageControls();
+    };
+  }
+
   async function persistEditorZones(){
     if(state.editorMode === "live" && state.event){
       await saveZones(state.event.code, state.editorZones);
@@ -1454,6 +1634,13 @@
       var isHalf = z.kind === "demimur";
       layer = L.polyline(z.points, { color:'#8b9184', weight: isHalf ? 3 : 5, dashArray: isHalf ? '5,5' : null })
         .addTo(map).bindTooltip(escapeHtml(z.name || (isHalf ? "Demi-mur" : "Mur")));
+    } else if(z.kind === "drapeau"){
+      var ownerColor = z.captureOwner ? teamColor(state.event || {}, z.captureOwner) : '#8f8b7a';
+      var flagLabel = z.captureOwner ? (escapeHtml(z.name) + ' · tenue par ' + escapeHtml(z.captureOwner)) :
+        (z.captureTarget ? (escapeHtml(z.name) + ' · capture par ' + escapeHtml(z.captureTarget) + ' (' + Math.round(z.captureProgress||0) + '%)') : (escapeHtml(z.name) + ' · neutre'));
+      layer = L.polygon(z.points, {
+        color: ownerColor, weight:2.5, fillColor: ownerColor, fillOpacity: z.captureOwner ? 0.3 : 0.12
+      }).addTo(map).bindTooltip(flagLabel);
     } else {
       var info = zoneStatusInfo(z.status);
       layer = L.polygon(z.points, {
@@ -1493,12 +1680,14 @@
     var isTerrain = z.kind === "terrain";
     var isWarzone = z.kind === "guerre";
     var isWall = z.kind === "mur" || z.kind === "demimur";
+    var isFlag = z.kind === "drapeau";
     var style, useLine = false;
     if(isTerrain){ style = { color:'#c9a227', weight:2, dashArray:'6,6', fillOpacity:0.04 }; }
     else if(isWarzone){ var wz = warzoneStyle(z); style = { color: wz.color, weight: wz.weight, fillColor: wz.color, fillOpacity: wz.fillOpacity, dashArray: wz.dashArray }; }
     else if(isWall){ useLine = true; var isHalf = z.kind === "demimur"; style = { color:'#8b9184', weight: isHalf?3:5, dashArray: isHalf?'5,5':null }; }
+    else if(isFlag){ var flagColor = z.captureOwner ? teamColor(state.event || {}, z.captureOwner) : '#8f8b7a'; style = { color: flagColor, weight:2.5, fillColor: flagColor, fillOpacity: z.captureOwner ? 0.3 : 0.12 }; }
     else{ var info = zoneStatusInfo(z.status); style = { color: info.color, weight:2, fillColor: info.color, fillOpacity:0.28 }; }
-    var tooltipTxt = isTerrain ? (z.name || "Limite du terrain") : (isWarzone ? (z.name + ' · ' + warzoneStyle(z).label) : (isWall ? (z.name || (z.kind==="demimur"?"Demi-mur":"Mur")) : z.name));
+    var tooltipTxt = isTerrain ? (z.name || "Limite du terrain") : (isWarzone ? (z.name + ' · ' + warzoneStyle(z).label) : (isWall ? (z.name || (z.kind==="demimur"?"Demi-mur":"Mur")) : (isFlag ? (z.name + (z.captureOwner ? ' · '+z.captureOwner : ' · neutre')) : z.name)));
     var poly = (useLine ? L.polyline(z.points, style) : L.polygon(z.points, style)).addTo(map).bindTooltip(escapeHtml(tooltipTxt));
     poly.on('click', function(){
       state.editingZoneId = isEditingThis ? null : z.id;
@@ -1525,10 +1714,11 @@
   }
 
   function orderedZones(zones){
-    // la limite de terrain d'abord (dessous), puis les zones de guerre, puis les bâtiments, puis les murs, puis les points (dessus)
+    // la limite de terrain d'abord (dessous), puis les zones de guerre, puis les bâtiments et
+    // drapeaux, puis les murs, puis les points (dessus)
     return zones.filter(function(z){ return z.kind === "terrain"; })
       .concat(zones.filter(function(z){ return z.kind === "guerre"; }))
-      .concat(zones.filter(function(z){ return z.kind === "building" || !z.kind; }))
+      .concat(zones.filter(function(z){ return z.kind === "building" || z.kind === "drapeau" || !z.kind; }))
       .concat(zones.filter(function(z){ return z.kind === "mur" || z.kind === "demimur"; }))
       .concat(zones.filter(function(z){ return z.kind === "point"; }));
   }
@@ -1618,6 +1808,7 @@
         '</div>' +
         '<div class="row" style="margin-top:6px;">' +
           '<button class="btn btn-sm btn-ghost" id="btn-start-warzone">☠ Zone de guerre</button>' +
+          '<button class="btn btn-sm btn-ghost" id="btn-start-flag">🚩 Drapeau</button>' +
         '</div>';
       document.getElementById("btn-start-terrain").onclick = function(){ state.editingZoneId = null; state.drawing = true; state.drawKind = "terrain"; state.drawPoints = []; drawExistingZones(); drawToolbar(); };
       document.getElementById("btn-start-draw").onclick = function(){ state.editingZoneId = null; state.drawing = true; state.drawKind = "building"; state.drawPoints = []; drawExistingZones(); drawToolbar(); };
@@ -1625,12 +1816,13 @@
       document.getElementById("btn-start-wall").onclick = function(){ state.editingZoneId = null; state.drawing = true; state.drawKind = "mur"; state.drawPoints = []; drawExistingZones(); drawToolbar(); };
       document.getElementById("btn-start-halfwall").onclick = function(){ state.editingZoneId = null; state.drawing = true; state.drawKind = "demimur"; state.drawPoints = []; drawExistingZones(); drawToolbar(); };
       document.getElementById("btn-start-warzone").onclick = function(){ state.editingZoneId = null; state.drawing = true; state.drawKind = "guerre"; state.drawPoints = []; drawExistingZones(); drawToolbar(); };
+      document.getElementById("btn-start-flag").onclick = function(){ state.editingZoneId = null; state.drawing = true; state.drawKind = "drapeau"; state.drawPoints = []; drawExistingZones(); drawToolbar(); };
       return;
     }
 
     var isWallKind = state.drawKind === "mur" || state.drawKind === "demimur";
     var minPts = isWallKind ? 2 : 3;
-    var label = state.drawKind === "terrain" ? "coin de la limite du terrain" : (state.drawKind === "guerre" ? "coin de la zone de guerre" : (isWallKind ? "point du tracé" : "coin du bâtiment"));
+    var label = state.drawKind === "terrain" ? "coin de la limite du terrain" : (state.drawKind === "guerre" ? "coin de la zone de guerre" : (state.drawKind === "drapeau" ? "coin de la zone drapeau" : (isWallKind ? "point du tracé" : "coin du bâtiment")));
     el.innerHTML =
       '<span class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">Points placés : '+state.drawPoints.length+' (min. '+minPts+')</span>' +
       '<div class="row" style="margin-top:6px;">' +
@@ -1662,9 +1854,10 @@
     if(state.drawPoints.length < minPts) return;
     var isTerrain = state.drawKind === "terrain";
     var isWarzone = state.drawKind === "guerre";
+    var isFlag = state.drawKind === "drapeau";
     var el = document.getElementById("editor-toolbar");
-    var nameLabel = isWarzone ? "de la zone" : (isWallKind ? (state.drawKind==="demimur"?"du demi-mur":"du mur") : "du bâtiment");
-    var namePlaceholder = isWarzone ? "Ex. Secteur Nord" : (isWallKind ? "Ex. Mur Est" : "Ex. Hangar Nord");
+    var nameLabel = isWarzone ? "de la zone" : (isFlag ? "du drapeau" : (isWallKind ? (state.drawKind==="demimur"?"du demi-mur":"du mur") : "du bâtiment"));
+    var namePlaceholder = isWarzone ? "Ex. Secteur Nord" : (isFlag ? "Ex. Point Alpha" : (isWallKind ? "Ex. Mur Est" : "Ex. Hangar Nord"));
     el.innerHTML =
       (isTerrain ? '' : '<div class="field" style="margin-top:0;"><label>Nom '+nameLabel+' (optionnel)</label><input type="text" id="zone-name" placeholder="'+namePlaceholder+'" /></div>') +
       (isWarzone ? '<div class="field"><label>Devient interdite dans (minutes)</label><input type="number" id="zone-minutes" value="5" min="1" style="text-align:left;" /></div>' : '') +
@@ -1688,6 +1881,12 @@
         var minutesInput = document.getElementById("zone-minutes");
         var minutes = Math.max(1, parseInt(minutesInput && minutesInput.value, 10) || 5);
         state.editorZones.push({ id: genId("w"), kind: "guerre", name: name2, points: state.drawPoints.slice(), deactivateAt: Date.now() + minutes*60000 });
+      } else if(isFlag){
+        var name4 = nameInput && nameInput.value.trim() ? nameInput.value.trim() : "Drapeau";
+        state.editorZones.push({
+          id: genId("f"), kind: "drapeau", name: name4, points: state.drawPoints.slice(),
+          captureOwner: null, captureTarget: null, captureProgress: 0, captureLastTick: null
+        });
       } else if(isWallKind){
         var name3 = nameInput && nameInput.value.trim() ? nameInput.value.trim() : (state.drawKind==="demimur" ? "Demi-mur" : "Mur");
         state.editorZones.push({ id: genId("w"), kind: state.drawKind, name: name3, points: state.drawPoints.slice() });
@@ -1799,6 +1998,19 @@
           '<button class="remove-chip zone-del" data-id="'+z.id+'">✕</button>' +
         '</div>';
       }
+      if(z.kind === "drapeau"){
+        var teamsForOverride = (state.editorMode === "live" && state.event) ? (state.event.teams||[]).filter(function(t){ return t.name !== "Staff"; }) : [];
+        var statusTxt = z.captureOwner ? ('tenue par '+z.captureOwner) : (z.captureTarget ? ('capture '+z.captureTarget+' '+Math.round(z.captureProgress||0)+'%') : 'neutre');
+        return '<div class="zone-row" style="flex-wrap:wrap;gap:6px;">' +
+          '<span style="font-size:14px;">🚩</span>' +
+          '<span class="name">'+escapeHtml(z.name)+' <span class="mono" style="font-size:10px;color:var(--ink-dim);">· '+escapeHtml(statusTxt)+'</span></span>' +
+          teamsForOverride.map(function(t){
+            return '<button class="btn btn-sm btn-ghost flag-assign" data-id="'+z.id+'" data-team="'+escapeHtml(t.name)+'" style="padding:6px 8px;font-size:11px;">'+escapeHtml(t.name)+'</button>';
+          }).join("") +
+          ((z.captureOwner || z.captureTarget) ? '<button class="btn btn-sm btn-ghost flag-reset" data-id="'+z.id+'" style="padding:6px 8px;">Neutraliser</button>' : "") +
+          '<button class="remove-chip zone-del" data-id="'+z.id+'">✕</button>' +
+        '</div>';
+      }
       var info = zoneStatusInfo(z.status);
       return '<div class="zone-row">' +
         '<span class="dot" style="background:'+info.color+'"></span>' +
@@ -1826,6 +2038,24 @@
       btn.onclick = async function(){
         var z = state.editorZones.find(function(z){ return z.id === btn.dataset.id; });
         if(z){ z.deactivateAt = Date.now(); drawExistingZones(); drawZoneList(); await persistEditorZones(); }
+      };
+    });
+    Array.prototype.forEach.call(wrap.querySelectorAll(".flag-assign"), function(btn){
+      btn.onclick = async function(){
+        var z = state.editorZones.find(function(z){ return z.id === btn.dataset.id; });
+        if(z){
+          z.captureOwner = btn.dataset.team; z.captureTarget = null; z.captureProgress = 0; z.captureLastTick = Date.now();
+          drawExistingZones(); drawZoneList(); await persistEditorZones();
+        }
+      };
+    });
+    Array.prototype.forEach.call(wrap.querySelectorAll(".flag-reset"), function(btn){
+      btn.onclick = async function(){
+        var z = state.editorZones.find(function(z){ return z.id === btn.dataset.id; });
+        if(z){
+          z.captureOwner = null; z.captureTarget = null; z.captureProgress = 0; z.captureLastTick = Date.now();
+          drawExistingZones(); drawZoneList(); await persistEditorZones();
+        }
       };
     });
     Array.prototype.forEach.call(wrap.querySelectorAll(".zone-del"), function(btn){
@@ -1863,6 +2093,7 @@
           if(!tpl){ el.innerHTML = '<div class="banner warn">Impossible de charger cette carte.</div>'; return; }
           state.editorZones = tpl.zones.map(function(z){
             if(z.kind === "point"){ return { id: genId("pt"), kind:"point", name:z.name, latlng:z.latlng, icon:z.icon, color:z.color }; }
+            if(z.kind === "drapeau"){ return { id: genId("f"), kind:"drapeau", name:z.name, points:z.points, captureOwner:null, captureTarget:null, captureProgress:0, captureLastTick:null }; }
             return { id: genId("z"), kind: z.kind || "building", name: z.name, points: z.points, status: "intact" };
           });
           drawExistingZones(); drawZoneList();
@@ -1914,6 +2145,12 @@
     if(state.editorMap){ state.editorMap.remove(); state.editorMap = null; }
     state.editorLayers = {};
     state.segmentLabelLayers = [];
+    if(state.refImageOverlayEl && state.refImageOverlayEl.parentNode){ state.refImageOverlayEl.parentNode.removeChild(state.refImageOverlayEl); }
+    state.refImageOverlayEl = null;
+    state.refImageDataUrl = null;
+    state.refImageCorners = null;
+    state.refImageRotation = 0;
+    state.refImagePlacing = false;
   }
 
   // ---------- Écran Rôles & visibilité (organisateur) ----------
@@ -2320,6 +2557,7 @@
             if(z.kind === "point") return { id: genId("pt"), kind:"point", name:z.name, latlng:z.latlng, icon:z.icon, color:z.color };
             if(z.kind === "terrain") return { id: genId("t"), kind:"terrain", name: z.name||"Limite du terrain", points: z.points };
             if(z.kind === "mur" || z.kind === "demimur") return { id: genId("w"), kind: z.kind, name: z.name, points: z.points };
+            if(z.kind === "drapeau") return { id: genId("f"), kind:"drapeau", name: z.name, points: z.points, captureOwner:null, captureTarget:null, captureProgress:0, captureLastTick:null };
             return { id: genId("z"), kind:"building", name: z.name, points: z.points, status:"intact" };
           });
           teardownLibraryMap();
@@ -2526,7 +2764,7 @@
     var cfg = state.event;
     app.innerHTML =
       '<div class="topbar"><button class="back">‹ Quitter</button><div class="eyebrow">'+escapeHtml(cfg.name)+' · '+cfg.code+'</div></div>' +
-      '<div class="map-rotate-wrapper" id="map-wrapper"><div id="map"></div><button class="map-fullscreen-btn" id="btn-fullscreen-map" title="Plein écran">⛶</button><div class="warzone-banner-overlay"><div id="warzone-banner"></div><div id="fog-banner"></div><div id="radar-bonus-banner"></div></div></div>' +
+      '<div class="map-rotate-wrapper" id="map-wrapper"><div id="map"></div><button class="map-fullscreen-btn" id="btn-fullscreen-map" title="Plein écran">⛶</button><div class="warzone-banner-overlay"><div id="warzone-banner"></div><div id="fog-banner"></div><div id="radar-bonus-banner"></div><div id="flag-banner"></div></div></div>' +
       '<div class="status-bar"><span class="status-dot" id="status-dot"></span><span id="status-text">Initialisation…</span></div>' +
       '<p id="zone-danger-note" class="mono" style="font-size:11px;color:#f2a89a;margin-top:4px;"></p>' +
       '<p id="offline-indicator" class="mono" style="font-size:11px;color:var(--amber);margin-top:4px;display:none;"></p>' +
@@ -2711,7 +2949,7 @@
   // données déjà en cache — pas besoin d'interroger le réseau plus souvent pour ça.
   function startWarzoneTicker(){
     if(state.warzoneTickTimer) return;
-    state.warzoneTickTimer = setInterval(function(){ updateWarzoneBanner(state.cachedZones); updateFogBanner(); updateRadarBonusBanner(); }, 1000);
+    state.warzoneTickTimer = setInterval(function(){ updateWarzoneBanner(state.cachedZones); updateFogBanner(); updateRadarBonusBanner(); updateFlagCaptureBanner(state.cachedZones); }, 1000);
   }
   function stopWarzoneTicker(){
     if(state.warzoneTickTimer){ clearInterval(state.warzoneTickTimer); state.warzoneTickTimer = null; }
@@ -3018,6 +3256,7 @@
     }
 
     if(vis.adminId && players[vis.adminId]) players[vis.adminId].isAdmin = true;
+    state.cachedAllPlayers = players;
 
     // Statut admin/staff recalculé à chaque cycle (transfert possible en cours de partie)
     state.isOrganizer = (vis.adminId === state.playerId);
@@ -3087,6 +3326,70 @@
     updateRoster(visible);
   }
 
+  // ---------- Capture de drapeaux (façon "Domination" : occupation exclusive requise) ----------
+  var CAPTURE_BASE_SECONDS = 90; // temps pour capturer seul, sans renfort
+  var CAPTURE_MAX_MULTIPLIER = 4; // plafond de bonus de vitesse selon le nombre de joueurs
+
+  // Ne fait rien tant que la zone n'a ni progression à figer ni horodatage à rafraîchir —
+  // évite une écriture Firebase à chaque cycle pour des zones drapeau inactives.
+  function tickFlagCaptures(zones, players){
+    var now = Date.now();
+    var dirty = false;
+    zones.forEach(function(z){
+      if(z.kind !== "drapeau") return;
+      var counts = {};
+      Object.keys(players||{}).forEach(function(pid){
+        var p = players[pid];
+        if(!p || !p.team || p.team === "Staff" || p.role === "staff") return;
+        if(typeof p.lat !== "number" || typeof p.lng !== "number") return;
+        if(pointInPolygon(p.lat, p.lng, z.points)) counts[p.team] = (counts[p.team]||0) + 1;
+      });
+      var teamsPresent = Object.keys(counts);
+      var last = z.captureLastTick || now;
+      var elapsed = Math.min((now - last) / 1000, 30); // borné pour éviter un bond après une longue absence
+
+      if(teamsPresent.length === 1){
+        var team = teamsPresent[0];
+        if(team === z.captureOwner){
+          if(z.captureLastTick !== now){ z.captureLastTick = now; dirty = true; }
+          return;
+        }
+        if(z.captureTarget !== team){ z.captureTarget = team; z.captureProgress = 0; }
+        var mult = Math.min(counts[team], CAPTURE_MAX_MULTIPLIER);
+        var rate = (100 / CAPTURE_BASE_SECONDS) * mult;
+        z.captureProgress = Math.min(100, (z.captureProgress||0) + rate * elapsed);
+        z.captureLastTick = now;
+        if(z.captureProgress >= 100){
+          z.captureOwner = team;
+          z.captureProgress = 0;
+          z.captureTarget = null;
+        }
+        dirty = true;
+      } else {
+        // Vide (personne) ou contesté (plusieurs équipes en même temps) : rien n'avance.
+        // On remet juste l'horodatage à jour, pour ne pas créer un bond de progression
+        // une fois la contestation terminée ou un joueur de retour.
+        if(z.captureLastTick !== now){ z.captureLastTick = now; dirty = true; }
+      }
+    });
+    return dirty;
+  }
+
+  function updateFlagCaptureBanner(zones){
+    var el = document.getElementById("flag-banner");
+    if(!el) return;
+    var active = (zones||[]).filter(function(z){ return z.kind === "drapeau" && z.captureTarget; });
+    if(!active.length){ el.innerHTML = ""; return; }
+    el.innerHTML = active.map(function(z){
+      var pct = Math.round(z.captureProgress||0);
+      return '<div class="warzone-alert pending">' +
+        '<div class="wz-name">🚩 '+escapeHtml(z.name)+'</div>' +
+        '<div class="wz-time">Capture '+escapeHtml(z.captureTarget)+' — '+pct+'%</div>' +
+        '<div class="flag-progress-track"><div class="flag-progress-fill" style="width:'+pct+'%;"></div></div>' +
+      '</div>';
+    }).join("");
+  }
+
   async function refreshZones(){
     if(!state.event) return;
     state.networkOk = true;
@@ -3097,10 +3400,21 @@
     } else {
       var existing = loadOfflineCache(state.event.code) || {};
       saveOfflineCache(state.event.code, Object.assign({}, existing, { zones: zones, ts: Date.now() }));
+      // Seuls les joueurs qui se trouvent EUX-MÊMES dans une zone drapeau calculent et
+      // écrivent la progression — ça évite que tout le monde réécrive les zones à chaque
+      // cycle, alors que seule une poignée de joueurs est concernée à un instant donné.
+      if(state.lastCoords){
+        var amInFlag = zones.some(function(z){ return z.kind === "drapeau" && pointInPolygon(state.lastCoords.lat, state.lastCoords.lng, z.points); });
+        if(amInFlag){
+          var changed = tickFlagCaptures(zones, state.cachedAllPlayers || {});
+          if(changed) await saveZones(state.event.code, zones);
+        }
+      }
     }
     state.cachedZones = zones;
     updateZonePolygons(zones);
     updateWarzoneBanner(zones);
+    updateFlagCaptureBanner(zones);
   }
 
   // ---------- Repli hors-ligne : dernière image connue (joueurs, zones, visibilité) ----------
