@@ -164,10 +164,11 @@
   .map-rotate-wrapper.fullscreen .map-fullscreen-btn{ top:calc(env(safe-area-inset-top, 0px) + 10px); }
   .warzone-banner-overlay{
     position:absolute; top:8px; left:8px; right:54px; z-index:405;
-    display:flex; flex-direction:column; gap:6px; pointer-events:none;
+    display:flex; flex-direction:column; gap:4px; pointer-events:auto;
+    max-height:40%; overflow-y:auto; overflow-x:hidden; -webkit-overflow-scrolling:touch;
   }
-  .map-rotate-wrapper.fullscreen .warzone-banner-overlay{ top:calc(env(safe-area-inset-top, 0px) + 10px); right:calc(env(safe-area-inset-right, 0px) + 54px); left:calc(env(safe-area-inset-left, 0px) + 8px); }
-  .mini-banner{ padding:5px 10px; border-radius:var(--radius); background:rgba(20,23,15,0.82); border:1px solid var(--line); pointer-events:auto; width:fit-content; }
+  .map-rotate-wrapper.fullscreen .warzone-banner-overlay{ top:calc(env(safe-area-inset-top, 0px) + 10px); right:calc(env(safe-area-inset-right, 0px) + 54px); left:calc(env(safe-area-inset-left, 0px) + 8px); max-height:55%; }
+  .mini-banner{ padding:4px 9px; border-radius:var(--radius); background:rgba(20,23,15,0.82); border:1px solid var(--line); pointer-events:auto; width:fit-content; font-size:11px; flex-shrink:0; }
   .status-bar{ display:flex; align-items:center; gap:8px; margin:10px 0; font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--ink-dim); letter-spacing:.05em; text-transform:uppercase; }
   .compass-row{ display:flex; align-items:center; gap:14px; margin-top:12px; }
   .compass-dial{
@@ -224,11 +225,11 @@
     font-family:'JetBrains Mono',monospace; font-size:11px; padding:6px; text-transform:uppercase;
   }
   .zone-legend{ display:flex; flex-wrap:wrap; gap:10px; font-family:'JetBrains Mono',monospace; font-size:10px; color:var(--ink-dim); text-transform:uppercase; letter-spacing:.04em; margin-top:8px; align-items:center; }
-  .warzone-alert{ padding:8px 12px; border-radius:var(--radius); border:1px solid; backdrop-filter: blur(2px); pointer-events:auto; }
-  .warzone-alert.pending{ border-color:var(--amber-dim); background:rgba(20,23,15,0.82); color:var(--amber); }
-  .warzone-alert.active{ border-color:var(--danger); background:rgba(35,15,12,0.85); color:#f2a89a; animation: warzoneflash 1.6s ease-in-out infinite; }
-  .warzone-alert .wz-name{ font-family:'JetBrains Mono',monospace; font-size:10px; text-transform:uppercase; letter-spacing:.05em; opacity:.85; }
-  .warzone-alert .wz-time{ font-size:20px; font-weight:700; margin-top:2px; }
+  .warzone-alert{ padding:5px 10px; border-radius:var(--radius); border:1px solid; backdrop-filter: blur(2px); pointer-events:auto; flex-shrink:0; }
+  .warzone-alert.pending{ border-color:var(--amber-dim); background:rgba(20,23,15,0.85); color:var(--amber); }
+  .warzone-alert.active{ border-color:var(--danger); background:rgba(35,15,12,0.88); color:#f2a89a; animation: warzoneflash 1.6s ease-in-out infinite; }
+  .warzone-alert .wz-name{ font-family:'JetBrains Mono',monospace; font-size:9.5px; text-transform:uppercase; letter-spacing:.04em; opacity:.85; }
+  .warzone-alert .wz-time{ font-size:13px; font-weight:700; margin-top:1px; }
   .flag-progress-track{ width:100%; height:5px; border-radius:3px; background:rgba(231,221,201,.18); margin-top:6px; overflow:hidden; }
   .flag-progress-fill{ height:100%; background:var(--amber); border-radius:3px; transition:width .4s ease-out; }
   @keyframes warzoneflash{ 0%,100%{ opacity:1; } 50%{ opacity:.55; } }
@@ -3369,7 +3370,7 @@
     var label = current ? escapeHtml(current.title) : "Tous les objectifs atteints";
     el.innerHTML = '<div class="warzone-alert pending">' +
       '<div class="wz-name">📂 Scénario — '+done+'/'+total+'</div>' +
-      '<div class="wz-time" style="font-size:14px;">'+label+'</div>' +
+      '<div class="wz-time" style="font-size:11px;">'+label+'</div>' +
     '</div>';
   }
 
@@ -4122,7 +4123,7 @@
       var elapsedMin = (Date.now() - cfg.createdAt) / 60000;
       if(elapsedMin >= cfg.timeLimitMinutes) msgs.push("⏱️ Temps écoulé (" + cfg.timeLimitMinutes + " min).");
     }
-    el.innerHTML = msgs.length ? ('<div class="warzone-alert active">' + msgs.map(function(m){ return '<div class="wz-name" style="font-size:13px;">'+m+'</div>'; }).join("") + '</div>') : "";
+    el.innerHTML = msgs.length ? ('<div class="warzone-alert active">' + msgs.map(function(m){ return '<div class="wz-name" style="font-size:11px;">'+m+'</div>'; }).join("") + '</div>') : "";
   }
 
   async function refreshZones(){
