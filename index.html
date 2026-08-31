@@ -1416,6 +1416,11 @@
     app.innerHTML =
       '<div class="topbar"><button class="back">‹ Retour</button><div class="eyebrow">Bâtiments</div></div>' +
       '<div id="editor-map"></div>' +
+      '<div class="panel" style="margin-top:8px;">' +
+        '<label class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">🖼️ Image de référence (aide au tracé)</label>' +
+        '<p style="margin-top:4px;">Superpose un plan existant (PDF exporté en image, photo drone, plan à main levée…) sur la carte pour tracer par-dessus plus précisément. Reste sur ton téléphone, pas envoyée aux autres joueurs.</p>' +
+        '<div id="ref-image-controls" style="margin-top:8px;"></div>' +
+      '</div>' +
       '<p class="mono" id="editor-geo-status" style="font-size:11px;color:var(--ink-dim);margin-top:6px;">Recherche de la position GPS…</p>' +
       '<p style="margin-top:4px;">Touche un bâtiment, une limite ou un point sur la carte pour faire apparaître ses poignées et le modifier. Touche-le à nouveau pour les cacher.</p>' +
       '<div class="editor-toolbar" id="editor-toolbar"></div>' +
@@ -1424,11 +1429,6 @@
       '<div class="row" style="margin-top:12px;">' +
         '<button class="btn btn-sm btn-ghost" id="btn-load-map">Charger une carte</button>' +
         '<button class="btn btn-sm btn-ghost" id="btn-save-map">Enregistrer comme modèle</button>' +
-      '</div>' +
-      '<div class="panel" style="margin-top:14px;">' +
-        '<label class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">🖼️ Image de référence (aide au tracé)</label>' +
-        '<p style="margin-top:4px;">Superpose un plan existant (PDF exporté en image, photo drone, plan à main levée…) sur la carte pour tracer par-dessus plus précisément. Reste sur ton téléphone, pas envoyée aux autres joueurs.</p>' +
-        '<div id="ref-image-controls" style="margin-top:8px;"></div>' +
       '</div>' +
       '<div id="editor-banner"></div>' +
       (state.editorMode === "draft" ? '<div class="stack" style="margin-top:14px;"><button class="btn btn-primary" id="btn-editor-done">Valider</button></div>' : '');
@@ -3854,7 +3854,9 @@
   function updateStaffUI(amStaff){
     var el = document.getElementById("staff-actions");
     if(!el) return;
-    if(!amStaff){ el.innerHTML = ""; el.dataset.bound = ""; return; }
+    // L'organisateur voit déjà tout (et plus) via le panneau admin — si en plus il a rejoint
+    // via l'équipe Staff, on évite d'afficher les deux panneaux en double.
+    if(!amStaff || state.isOrganizer){ el.innerHTML = ""; el.dataset.bound = ""; return; }
     if(el.dataset.bound === "1") return;
     el.dataset.bound = "1";
     el.innerHTML = '<div class="test-toggle"><span class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">Visible des autres joueurs (staff)</span>' +
