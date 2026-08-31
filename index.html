@@ -164,11 +164,11 @@
   .map-rotate-wrapper.fullscreen .map-fullscreen-btn{ top:calc(env(safe-area-inset-top, 0px) + 10px); }
   .warzone-banner-overlay{
     position:absolute; top:8px; left:8px; right:54px; z-index:405;
-    display:flex; flex-direction:column; gap:4px; pointer-events:auto;
-    max-height:40%; overflow-y:auto; overflow-x:hidden; -webkit-overflow-scrolling:touch;
+    display:flex; flex-direction:column; gap:3px; pointer-events:auto;
+    max-height:30%; overflow-y:auto; overflow-x:hidden; -webkit-overflow-scrolling:touch;
   }
-  .map-rotate-wrapper.fullscreen .warzone-banner-overlay{ top:calc(env(safe-area-inset-top, 0px) + 10px); right:calc(env(safe-area-inset-right, 0px) + 54px); left:calc(env(safe-area-inset-left, 0px) + 8px); max-height:55%; }
-  .mini-banner{ padding:4px 9px; border-radius:var(--radius); background:rgba(20,23,15,0.82); border:1px solid var(--line); pointer-events:auto; width:fit-content; font-size:11px; flex-shrink:0; }
+  .map-rotate-wrapper.fullscreen .warzone-banner-overlay{ top:calc(env(safe-area-inset-top, 0px) + 10px); right:calc(env(safe-area-inset-right, 0px) + 54px); left:calc(env(safe-area-inset-left, 0px) + 8px); max-height:45%; }
+  .mini-banner{ padding:3px 8px; border-radius:var(--radius); background:rgba(20,23,15,0.82); border:1px solid var(--line); pointer-events:auto; width:fit-content; font-size:10px; flex-shrink:0; }
   .status-bar{ display:flex; align-items:center; gap:8px; margin:10px 0; font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--ink-dim); letter-spacing:.05em; text-transform:uppercase; }
   .compass-row{ display:flex; align-items:center; gap:14px; margin-top:12px; }
   .compass-dial{
@@ -225,12 +225,12 @@
     font-family:'JetBrains Mono',monospace; font-size:11px; padding:6px; text-transform:uppercase;
   }
   .zone-legend{ display:flex; flex-wrap:wrap; gap:10px; font-family:'JetBrains Mono',monospace; font-size:10px; color:var(--ink-dim); text-transform:uppercase; letter-spacing:.04em; margin-top:8px; align-items:center; }
-  .warzone-alert{ padding:5px 10px; border-radius:var(--radius); border:1px solid; backdrop-filter: blur(2px); pointer-events:auto; flex-shrink:0; }
+  .warzone-alert{ padding:3px 8px; border-radius:var(--radius); border:1px solid; backdrop-filter: blur(2px); pointer-events:auto; flex-shrink:0; }
   .warzone-alert.pending{ border-color:var(--amber-dim); background:rgba(20,23,15,0.85); color:var(--amber); }
   .warzone-alert.active{ border-color:var(--danger); background:rgba(35,15,12,0.88); color:#f2a89a; animation: warzoneflash 1.6s ease-in-out infinite; }
-  .warzone-alert .wz-name{ font-family:'JetBrains Mono',monospace; font-size:9.5px; text-transform:uppercase; letter-spacing:.04em; opacity:.85; }
-  .warzone-alert .wz-time{ font-size:13px; font-weight:700; margin-top:1px; }
-  .flag-progress-track{ width:100%; height:5px; border-radius:3px; background:rgba(231,221,201,.18); margin-top:6px; overflow:hidden; }
+  .warzone-alert .wz-name{ font-family:'JetBrains Mono',monospace; font-size:8.5px; text-transform:uppercase; letter-spacing:.03em; opacity:.85; }
+  .warzone-alert .wz-time{ font-size:11px; font-weight:700; margin-top:0; }
+  .flag-progress-track{ width:100%; height:3px; border-radius:2px; background:rgba(231,221,201,.18); margin-top:3px; overflow:hidden; }
   .flag-progress-fill{ height:100%; background:var(--amber); border-radius:3px; transition:width .4s ease-out; }
   @keyframes warzoneflash{ 0%,100%{ opacity:1; } 50%{ opacity:.55; } }
   .zone-legend .dot{ width:8px; height:8px; }
@@ -443,6 +443,7 @@
     refImageOverlayEl: null,
     cachedZones: [],
     modAuthed: false,
+    orgAccessUnlocked: false,
     batteryLevel: null,
     batterySaverMode: false,
     batteryWatched: false,
@@ -1091,6 +1092,10 @@
             ? '<button class="btn btn-sm btn-ghost" id="btn-edit-buildings" style="margin-top:8px;">Délimiter / dessiner / charger une carte</button>'
             : '<p style="margin-top:8px;font-size:12px;">Définis d\u2019abord la position du terrain ci-dessus.</p>') +
         '</div>' +
+        '<div class="field"><label>Code d\u2019accès organisateur (optionnel)</label>' +
+          '<input type="text" id="ev-access-code" placeholder="Laisse vide pour ne pas verrouiller" value="'+escapeHtml(state._draftAccessCode||"")+'" />' +
+          '<p style="margin-top:4px;font-size:11px;color:var(--ink-dim);">Si rempli, "Éditer la carte", "Rôles & visibilité" et "Mode de jeu" demanderont ce code avant de s\u2019ouvrir — même pour quelqu\u2019un qui deviendrait organisateur plus tard.</p>' +
+        '</div>' +
       '</div>' +
       '<div class="stack" style="margin-top:16px;">' +
         '<button class="btn btn-primary" id="btn-generate">Générer le code et le QR</button>' +
@@ -1125,6 +1130,7 @@
     };
 
     document.getElementById("ev-name").oninput = function(e){ state._draftName = e.target.value; };
+    document.getElementById("ev-access-code").oninput = function(e){ state._draftAccessCode = e.target.value; };
 
     if(state._draftCenter){
       document.getElementById("btn-edit-buildings").onclick = function(){
@@ -1167,12 +1173,14 @@
         createdAt: Date.now(),
         captureBaseMinutes: 10,
         scorePointsPerInterval: 1,
-        scoreIntervalSeconds: 30
+        scoreIntervalSeconds: 30,
+        accessCode: (state._draftAccessCode||"").trim() || null
       };
       var ok = await saveEventConfig(cfg);
       if(!ok){ state.lastEventErr = "Impossible de créer l'événement pour l'instant. Réessaie."; render(); return; }
       state.event = cfg;
       state.isOrganizer = true;
+      state.orgAccessUnlocked = true; // il vient de choisir ce code lui-même, pas besoin de le retaper
       state.lastEventErr = "";
       state.zonesSaveWarning = "";
       await saveVisibility(code, { revealedTeams: [], adminId: state.playerId });
@@ -1362,6 +1370,7 @@
       if(state.player.team === "Staff"){ state.player._grantStaffOnJoin = true; }
       state.player.livesRemaining = undefined;
       state.player._wasInSpawn = false;
+      state.orgAccessUnlocked = false;
       state.screen = "map";
       render();
     }
@@ -1404,6 +1413,35 @@
   }
 
   // ---------- Éditeur de bâtiments ----------
+  // ---------- Verrou d'accès organisateur (code choisi par le créateur de l'événement) ----------
+  // Protège les trois écrans "de pouvoir" (édition de carte, rôles, mode de jeu), y compris
+  // pour quelqu'un qui deviendrait organisateur plus tard via "Devenir administrateur" — le
+  // code choisi à la création reste la vraie clé, pas juste le statut du moment.
+  function requiresOrgAccess(){
+    return !!(state.event && state.event.accessCode && !state.orgAccessUnlocked);
+  }
+  function renderOrgAccessGate(){
+    app.innerHTML =
+      '<div class="topbar"><button class="back">‹ Retour</button><div class="eyebrow">Accès protégé</div></div>' +
+      '<div class="panel"><p>Cette section est protégée par un code choisi par l\u2019organisateur à la création de l\u2019événement.</p>' +
+        '<div class="field" style="margin-top:0;"><label>Code d\u2019accès</label><input type="password" id="org-access-input" placeholder="Code" /></div>' +
+        '<button class="btn btn-primary" id="btn-org-access-submit" style="margin-top:8px;">Valider</button>' +
+        '<div id="org-access-banner"></div>' +
+      '</div>';
+    document.querySelector(".back").onclick = function(){ state.screen="map"; render(); };
+    var submit = function(){
+      var val = document.getElementById("org-access-input").value;
+      if(val && val === state.event.accessCode){
+        state.orgAccessUnlocked = true;
+        render();
+      } else {
+        document.getElementById("org-access-banner").innerHTML = '<div class="banner warn">Code incorrect.</div>';
+      }
+    };
+    document.getElementById("btn-org-access-submit").onclick = submit;
+    document.getElementById("org-access-input").addEventListener("keydown", function(e){ if(e.key === "Enter") submit(); });
+  }
+
   function renderMapEditor(){
     // Filet de sécurité : même si le bouton n'est visible que pour l'organisateur/staff,
     // on vérifie aussi ici — un joueur simple ne doit jamais pouvoir éditer la carte d'un
@@ -1413,6 +1451,7 @@
       render();
       return;
     }
+    if(state.editorMode === "live" && requiresOrgAccess()){ renderOrgAccessGate(); return; }
     var center = state.editorCenter;
     app.innerHTML =
       '<div class="topbar"><button class="back">‹ Retour</button><div class="eyebrow">Bâtiments</div></div>' +
@@ -2526,6 +2565,7 @@
 
   // ---------- Écran Rôles & visibilité (organisateur) ----------
   function renderRoles(){
+    if(requiresOrgAccess()){ renderOrgAccessGate(); return; }
     var cfg = state.event;
     app.innerHTML =
       '<div class="topbar"><button class="back">‹ Retour</button><div class="eyebrow">Rôles & visibilité</div></div>' +
@@ -2572,6 +2612,16 @@
         '<div id="bonus-squad-list" style="margin-top:6px;"></div>' +
         '<p class="mono" style="font-size:10px;color:var(--ink-dim);text-transform:uppercase;margin-top:10px;">Joueur individuel</p>' +
         '<div id="bonus-list" style="margin-top:6px;"></div>' +
+      '</div>' +
+      '<div class="panel" style="margin-top:14px;">' +
+        '<label class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">🔒 Code d\u2019accès organisateur</label>' +
+        '<p style="margin-top:4px;">'+(cfg.accessCode ? "Actuellement verrouillé — nécessaire pour Éditer la carte, Rôles & visibilité et Mode de jeu." : "Aucun code pour l\u2019instant — ces écrans sont ouverts à l\u2019organisateur et au staff sans code.")+'</p>' +
+        '<div class="field" style="margin-top:6px;"><label>'+(cfg.accessCode ? "Changer le code" : "Définir un code")+'</label><input type="text" id="access-code-input" placeholder="Nouveau code" /></div>' +
+        '<div class="row" style="margin-top:6px;">' +
+          '<button class="btn btn-sm btn-primary" id="btn-access-code-save">Enregistrer</button>' +
+          (cfg.accessCode ? '<button class="btn btn-sm btn-ghost" id="btn-access-code-remove">Retirer le verrou</button>' : '') +
+        '</div>' +
+        '<div id="access-code-banner"></div>' +
       '</div>';
 
     document.querySelector(".back").onclick = function(){ state.screen = "map"; render(); };
@@ -2582,6 +2632,23 @@
       document.getElementById("roles-banner").innerHTML =
         '<div class="banner info">'+(n ? (n+" doublon(s) supprimé(s).") : "Aucun doublon trouvé.")+'</div>';
       loadRolesData();
+    };
+    document.getElementById("btn-access-code-save").onclick = async function(){
+      var val = document.getElementById("access-code-input").value.trim();
+      if(!val) return;
+      state.event.accessCode = val;
+      var ok = await saveEventConfig(state.event);
+      document.getElementById("access-code-banner").innerHTML = ok
+        ? '<div class="banner info">Code enregistré.</div>'
+        : '<div class="banner warn">Échec de l\u2019enregistrement.</div>';
+      if(ok) render();
+    };
+    var removeBtn = document.getElementById("btn-access-code-remove");
+    if(removeBtn) removeBtn.onclick = async function(){
+      if(!confirm("Retirer le verrou d\u2019accès organisateur ? Ces écrans redeviendront ouverts sans code.")) return;
+      state.event.accessCode = null;
+      var ok = await saveEventConfig(state.event);
+      if(ok) render();
     };
     loadRolesData();
 
@@ -3138,6 +3205,7 @@
       render();
       return;
     }
+    if(requiresOrgAccess()){ renderOrgAccessGate(); return; }
     app.innerHTML =
       '<div class="topbar"><button class="back">‹ Retour</button><div class="eyebrow">🕹 Mode de jeu</div></div>' +
       '<p style="margin-top:4px;">Les mécaniques disponibles pour cette partie. Certaines se configurent directement ici, d\u2019autres depuis l\u2019éditeur de carte ou Rôles &amp; visibilité.</p>' +
