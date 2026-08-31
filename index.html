@@ -427,10 +427,10 @@
     editingZoneId: null,   // zone en cours de modification (poignées visibles) dans l'éditeur
     editorMeMarker: null,
     refImageDataUrl: null,
-    refImageCorners: null,
+    refImageBounds: null,
+    refImageHandles: [],
     refImageRotation: 0,
     refImageOpacity: 0.6,
-    refImagePlacing: false,
     flagCreationMode: null,
     warzoneCreationMode: null,
     trails: {},
@@ -1478,10 +1478,6 @@
         confirmGasZone([e.latlng.lat, e.latlng.lng]);
         return;
       }
-      if(state.refImagePlacing){
-        handleRefImageCornerTap([e.latlng.lat, e.latlng.lng]);
-        return;
-      }
       if(state.placingPoint){
         openPointForm([e.latlng.lat, e.latlng.lng]);
         return;
@@ -1540,13 +1536,17 @@
   // Ne quitte jamais l'appareil : ni enregistrée sur Firebase, ni envoyée aux autres joueurs.
   // Sert uniquement à caler visuellement les tracés (bâtiments, murs, drapeaux…) sur un plan
   // existant (PDF exporté en image, photo drone, plan à main levée…) pendant l'édition.
+  // L'image est définie par ses limites nord/sud/est/ouest (comme un rectangle), plutôt que
+  // deux points saisis au tap — bien plus précis à ajuster avec 4 vraies poignées qu'à
+  // positionner du premier coup en tapant sur un petit écran.
   function updateRefImageOverlayPosition(){
-    if(!state.editorMap || !state.refImageCorners || state.refImageCorners.length < 2 || !state.refImageOverlayEl) return;
+    if(!state.editorMap || !state.refImageBounds || !state.refImageOverlayEl) return;
     var map = state.editorMap;
-    // latLngToLayerPoint (et non containerPoint) : notre image vit maintenant dans un vrai
-    // panneau Leaflet, qui suit déjà automatiquement les déplacements de la carte.
-    var p1 = map.latLngToLayerPoint(state.refImageCorners[0]);
-    var p2 = map.latLngToLayerPoint(state.refImageCorners[1]);
+    var b = state.refImageBounds;
+    // latLngToLayerPoint (et non containerPoint) : notre image vit dans un vrai panneau
+    // Leaflet, qui suit déjà automatiquement les déplacements de la carte.
+    var p1 = map.latLngToLayerPoint([b.north, b.west]);
+    var p2 = map.latLngToLayerPoint([b.south, b.east]);
     var left = Math.min(p1.x, p2.x), top = Math.min(p1.y, p2.y);
     var width = Math.abs(p2.x - p1.x), height = Math.abs(p2.y - p1.y);
     var el = state.refImageOverlayEl;
@@ -1580,14 +1580,48 @@
     updateRefImageOverlayPosition();
   }
 
-  function handleRefImageCornerTap(latlng){
-    if(!state.refImageCorners) state.refImageCorners = [];
-    state.refImageCorners.push(latlng);
-    if(state.refImageCorners.length >= 2){
-      state.refImagePlacing = false;
-      createRefImageOverlay();
-    }
-    renderRefImageControls();
+  // Place l'image d'entrée de jeu au centre de la vue actuelle, sur environ 70% de l'écran
+  // visible — le joueur n'a alors plus qu'à ajuster les 4 coins, sans avoir à taper deux
+  // points précis du premier coup.
+  function placeDefaultRefImageBounds(){
+    if(!state.editorMap) return;
+    var b = state.editorMap.getBounds();
+    var latPad = (b.getNorth() - b.getSouth()) * 0.15;
+    var lngPad = (b.getEast() - b.getWest()) * 0.15;
+    state.refImageBounds = {
+      north: b.getNorth() - latPad, south: b.getSouth() + latPad,
+      east: b.getEast() - lngPad, west: b.getWest() + lngPad
+    };
+  }
+
+  function clearRefImageCornerHandles(){
+    (state.refImageHandles||[]).forEach(function(h){ if(state.editorMap) state.editorMap.removeLayer(h); });
+    state.refImageHandles = [];
+  }
+
+  // Quatre poignées, une par coin — comme pour les bâtiments. Chaque poignée ne contrôle que
+  // SES deux bords propres (ex. la poignée haut-gauche déplace le nord et l'ouest), le coin
+  // opposé reste fixe pendant qu'on ajuste : un comportement de redimensionnement classique.
+  function renderRefImageCornerHandles(){
+    if(!state.editorMap || !state.refImageBounds) return;
+    clearRefImageCornerHandles();
+    var b = state.refImageBounds;
+    var corners = [
+      { lat: b.north, lng: b.west, setLat:"north", setLng:"west" },
+      { lat: b.north, lng: b.east, setLat:"north", setLng:"east" },
+      { lat: b.south, lng: b.east, setLat:"south", setLng:"east" },
+      { lat: b.south, lng: b.west, setLat:"south", setLng:"west" }
+    ];
+    corners.forEach(function(c){
+      var handle = L.marker([c.lat, c.lng], { icon: vertexHandleIcon(), draggable: true }).addTo(state.editorMap);
+      handle.on('drag', function(e){
+        var ll = e.target.getLatLng();
+        state.refImageBounds[c.setLat] = ll.lat;
+        state.refImageBounds[c.setLng] = ll.lng;
+        updateRefImageOverlayPosition();
+      });
+      state.refImageHandles.push(handle);
+    });
   }
 
   function renderRefImageControls(){
@@ -1595,6 +1629,7 @@
     if(!el) return;
 
     if(!state.refImageDataUrl){
+      clearRefImageCornerHandles();
       el.innerHTML =
         '<input type="file" accept="image/*" id="ref-image-file" style="display:none;" />' +
         '<button class="btn btn-sm btn-ghost" id="btn-ref-image-pick">Choisir une image</button>';
@@ -1607,8 +1642,9 @@
         var reader = new FileReader();
         reader.onload = function(ev){
           state.refImageDataUrl = ev.target.result;
-          state.refImageCorners = [];
-          state.refImagePlacing = true;
+          placeDefaultRefImageBounds();
+          createRefImageOverlay();
+          renderRefImageCornerHandles();
           renderRefImageControls();
         };
         reader.readAsDataURL(file);
@@ -1616,25 +1652,14 @@
       return;
     }
 
-    if(state.refImagePlacing){
-      var n = (state.refImageCorners||[]).length;
-      el.innerHTML =
-        '<p class="mono" style="font-size:11px;color:var(--ink-dim);">Touche 2 points sur la carte : le coin haut-gauche de l\u2019image, puis son coin bas-droit. ('+n+'/2)</p>' +
-        '<button class="btn btn-sm btn-ghost" id="btn-ref-image-cancel">Annuler</button>';
-      document.getElementById("btn-ref-image-cancel").onclick = function(){
-        state.refImageDataUrl = null; state.refImageCorners = null; state.refImagePlacing = false;
-        renderRefImageControls();
-      };
-      return;
-    }
-
     el.innerHTML =
-      '<div class="field" style="margin-top:0;"><label id="ref-image-rot-label">Rotation ('+Math.round(state.refImageRotation)+'\u00b0)</label>' +
+      '<p class="mono" style="font-size:11px;color:var(--ink-dim);">Fais glisser un des 4 coins sur la carte pour ajuster la taille et la position.</p>' +
+      '<div class="field"><label id="ref-image-rot-label">Rotation ('+Math.round(state.refImageRotation)+'\u00b0)</label>' +
         '<input type="range" id="ref-image-rotation" min="0" max="359" value="'+Math.round(state.refImageRotation)+'" /></div>' +
       '<div class="field"><label id="ref-image-op-label">Opacit\u00e9 ('+Math.round(state.refImageOpacity*100)+'%)</label>' +
         '<input type="range" id="ref-image-opacity" min="10" max="100" value="'+Math.round(state.refImageOpacity*100)+'" /></div>' +
       '<div class="row" style="margin-top:8px;">' +
-        '<button class="btn btn-sm btn-ghost" id="btn-ref-image-reposition">Repositionner les coins</button>' +
+        '<button class="btn btn-sm btn-ghost" id="btn-ref-image-reposition">Recentrer</button>' +
         '<button class="btn btn-sm btn-ghost" id="btn-ref-image-remove">Retirer l\u2019image</button>' +
       '</div>';
     document.getElementById("ref-image-rotation").oninput = function(e){
@@ -1650,17 +1675,16 @@
       if(lbl) lbl.textContent = "Opacit\u00e9 (" + Math.round(state.refImageOpacity*100) + "%)";
     };
     document.getElementById("btn-ref-image-reposition").onclick = function(){
-      if(state.refImageOverlayEl && state.refImageOverlayEl.parentNode){ state.refImageOverlayEl.parentNode.removeChild(state.refImageOverlayEl); }
-      state.refImageOverlayEl = null;
-      state.refImageCorners = [];
-      state.refImagePlacing = true;
-      renderRefImageControls();
+      placeDefaultRefImageBounds();
+      updateRefImageOverlayPosition();
+      renderRefImageCornerHandles();
     };
     document.getElementById("btn-ref-image-remove").onclick = function(){
+      clearRefImageCornerHandles();
       if(state.refImageOverlayEl && state.refImageOverlayEl.parentNode){ state.refImageOverlayEl.parentNode.removeChild(state.refImageOverlayEl); }
       state.refImageOverlayEl = null;
       state.refImageDataUrl = null;
-      state.refImageCorners = null;
+      state.refImageBounds = null;
       state.refImageRotation = 0;
       renderRefImageControls();
     };
@@ -2490,9 +2514,9 @@
     if(state.refImageOverlayEl && state.refImageOverlayEl.parentNode){ state.refImageOverlayEl.parentNode.removeChild(state.refImageOverlayEl); }
     state.refImageOverlayEl = null;
     state.refImageDataUrl = null;
-    state.refImageCorners = null;
+    state.refImageBounds = null;
+    state.refImageHandles = [];
     state.refImageRotation = 0;
-    state.refImagePlacing = false;
     state.flagCreationMode = null;
     state.warzoneCreationMode = null;
     state.drawPointsRedo = [];
