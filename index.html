@@ -3233,11 +3233,10 @@
   function renderChat(){
     if(!state.event) return;
     if(!state.chatChannel) state.chatChannel = "team";
-    var amPrivileged = state.isOrganizer || state.player.role === "staff";
     app.innerHTML =
       '<div class="topbar"><button class="back">‹ Retour</button><div class="eyebrow">💬 Chat</div></div>' +
-      '<div class="row" style="margin-top:6px;">' +
-        '<button class="btn btn-sm '+(state.chatChannel==="team"?"btn-primary":"btn-ghost")+'" id="btn-chat-tab-team">'+(amPrivileged?"Toutes équipes":("🔒 "+escapeHtml(state.player.team||"Équipe")))+'</button>' +
+      '<div class="row" style="margin-top:6px;flex-wrap:wrap;">' +
+        '<button class="btn btn-sm '+(state.chatChannel==="team"?"btn-primary":"btn-ghost")+'" id="btn-chat-tab-team">🔒 '+escapeHtml(state.player.team||"Équipe")+'</button>' +
         '<button class="btn btn-sm '+(state.chatChannel==="global"?"btn-primary":"btn-ghost")+'" id="btn-chat-tab-global">🌐 Global</button>' +
       '</div>' +
       '<div id="chat-list" style="max-height:46vh;overflow-y:auto;display:flex;flex-direction:column;gap:6px;margin-top:8px;"></div>' +
@@ -3388,28 +3387,22 @@
     var el = document.getElementById("chat-list");
     if(!el || !state.event) return;
     var chat = await loadChat(state.event.code);
-    var amPrivileged = state.isOrganizer || state.player.role === "staff";
     var myTeam = state.player.team;
     var entries;
     if(state.chatChannel === "global"){
       entries = chat.filter(function(m){ return m.to === "global"; });
     } else {
-      // Canal "équipe" : privé — un joueur simple ne voit que sa propre équipe. Le
-      // staff/organisateur voit toutes les équipes (comme le Journal général).
-      entries = chat.filter(function(m){
-        if(m.to === "global") return false;
-        return amPrivileged || m.to === myTeam;
-      });
+      // Canal "équipe" : strictement privé à sa propre équipe, y compris pour le staff et
+      // l'organisateur — pas de fusion automatique des équipes ici, seul "Global" est partagé.
+      entries = chat.filter(function(m){ return m.to === myTeam; });
     }
     if(!entries.length){ el.innerHTML = '<p>Aucun message pour l\u2019instant.</p>'; return; }
     var wasNearBottom = (el.scrollTop + el.clientHeight >= el.scrollHeight - 30);
-    var showTeamTag = amPrivileged && state.chatChannel === "team";
     el.innerHTML = entries.map(function(m){
       var d = new Date(m.ts);
       var hh = ("0"+d.getHours()).slice(-2), mm = ("0"+d.getMinutes()).slice(-2);
-      var teamTag = showTeamTag ? (' ('+escapeHtml(m.fromTeam||"?")+')') : '';
       return '<div class="zone-row" style="flex-direction:column;align-items:flex-start;gap:2px;">' +
-        '<span class="mono" style="font-size:10px;color:var(--ink-dim);">'+escapeHtml(m.from||"?")+teamTag+' \u00b7 '+hh+':'+mm+'</span>' +
+        '<span class="mono" style="font-size:10px;color:var(--ink-dim);">'+escapeHtml(m.from||"?")+' \u00b7 '+hh+':'+mm+'</span>' +
         (m.audio ? ('<audio controls src="'+m.audio+'" style="width:100%;height:32px;margin-top:2px;"></audio>') : '') +
         (m.text ? ('<span>'+escapeHtml(m.text)+'</span>') : '') +
       '</div>';
@@ -3880,7 +3873,7 @@
       '<p id="refresh-rate-note" class="mono" style="font-size:10px;color:var(--ink-dim);margin-top:2px;"></p>' +
       '<div id="geo-banner"></div>' +
       '<p class="mono" id="vis-note" style="font-size:11px;color:var(--amber);margin-top:6px;"></p>' +
-      '<div class="row" style="margin-top:10px;">' +
+      '<div class="row" style="margin-top:10px;flex-wrap:wrap;">' +
         '<button class="btn btn-sm '+(state.player.sos?'btn-danger':'btn-ghost')+'" id="btn-sos">'+(state.player.sos?'🆘 Annuler la demande d\u2019aide':'🆘 Demander de l\u2019aide')+'</button>' +
         '<button class="btn btn-sm btn-ghost" id="btn-ping-menu">📍 Ping</button>' +
         '<button class="btn btn-sm '+(state.trailDuration?'btn-primary':'btn-ghost')+'" id="btn-trail-menu">🛤️ Trajectoire</button>' +
@@ -3893,7 +3886,7 @@
       '<div id="claim-admin"></div>' +
       '<div class="field" style="margin-top:12px;"><input type="text" id="roster-search" placeholder="Rechercher un joueur…" value="'+escapeHtml(state.rosterSearch)+'" /></div>' +
       '<div class="roster" id="roster"></div>' +
-      '<div id="admin-actions" class="row" style="margin-top:10px;"></div>';
+      '<div id="admin-actions" class="row" style="margin-top:10px;flex-wrap:wrap;"></div>';
 
     document.querySelector(".back").onclick = function(){ teardownMap(); state.screen="home"; render(); };
     document.getElementById("test-mode").onchange = function(e){ state.testMode = e.target.checked; applyGeoMode(); };
@@ -4365,7 +4358,7 @@
     el.dataset.bound = "1";
     el.innerHTML = '<div class="test-toggle"><span class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">Visible des autres joueurs (staff)</span>' +
       '<input type="checkbox" id="staff-visible-toggle" '+(state.player.staffHidden?'':'checked')+' /></div>' +
-      '<div class="row" style="margin-top:8px;">' +
+      '<div class="row" style="margin-top:8px;flex-wrap:wrap;">' +
         '<button class="btn btn-ghost btn-sm" id="btn-edit-buildings-staff">Éditer la carte</button>' +
         '<button class="btn btn-ghost btn-sm" id="btn-code-staff">Code / QR</button>' +
         '<button class="btn btn-ghost btn-sm" id="btn-log-staff">📋 Journal</button>' +
