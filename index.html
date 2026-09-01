@@ -445,6 +445,14 @@
     modAuthed: false,
     orgAccessUnlocked: false,
     pingPlacingKind: null,
+    chatPollTimer: null,
+    chatToTeam: null,
+    voiceRecorder: null,
+    voiceChunks: [],
+    voiceStream: null,
+    voiceRecordStart: 0,
+    voiceRecordTimer: null,
+    voicePreviewDataUrl: null,
     batteryLevel: null,
     batterySaverMode: false,
     batteryWatched: false,
@@ -648,7 +656,8 @@
     { kind:"danger",   emoji:"\u26a0\ufe0f", label:"Danger" },
     { kind:"contact",  emoji:"\ud83d\udea8", label:"Contact" },
     { kind:"ennemi",   emoji:"\ud83d\udc41", label:"Ennemi aper\u00e7u" },
-    { kind:"bombe",    emoji:"\ud83d\udca3", label:"Bombe trouv\u00e9e/pos\u00e9e" }
+    { kind:"bombe",    emoji:"\ud83d\udca3", label:"Bombe trouv\u00e9e/pos\u00e9e" },
+    { kind:"blesse",   emoji:"\ud83e\ude78", label:"Bless\u00e9" }
   ];
   function eventPingsKey(code){ return "event:" + code + ":pings"; }
   function eventScoreKey(code){ return "event:" + code + ":score"; }
@@ -660,6 +669,27 @@
   async function saveScore(code, score){
     return storageSet(eventScoreKey(code), JSON.stringify(score));
   }
+
+  // ---------- Chat (équipe, ou vers une autre équipe / le staff) ----------
+  function eventChatKey(code){ return "event:" + code + ":chat"; }
+  async function loadChat(code){
+    var raw = await storageGet(eventChatKey(code));
+    if(!raw) return [];
+    try{ return JSON.parse(raw); }catch(e){ return []; }
+  }
+  async function sendChatMessage(code, toTeam, text, audioData){
+    var chat = await loadChat(code);
+    chat.push({
+      id: genId("msg"), ts: Date.now(), from: state.player.name || "?",
+      fromTeam: state.player.team || null, to: toTeam, text: text || "", audio: audioData || null
+    });
+    // Plafond plus bas qu'un journal texte pur : les messages vocaux pèsent bien plus
+    // lourd, mieux vaut garder un historique plus court que de faire grossir le bloc
+    // Firebase sans limite.
+    if(chat.length > 150) chat = chat.slice(chat.length - 150);
+    return storageSet(eventChatKey(code), JSON.stringify(chat));
+  }
+
   async function loadPings(code){
     var raw = await storageGet(eventPingsKey(code));
     if(!raw) return [];
@@ -888,6 +918,8 @@
   var _lastPushedScreen = null;
   function render(){
     stopMapIfNeeded();
+    stopChatIfNeeded();
+    stopVoiceIfNeeded();
     // Synchronise l'écran courant avec l'historique du navigateur : sans ça, le bouton
     // "retour" du téléphone ne voit qu'une seule page du début à la fin de l'appli, et
     // saute direct au tout début (ou ferme l'appli) au lieu de revenir écran par écran.
@@ -911,6 +943,7 @@
     if(state.screen === "moderation") return renderModeration();
     if(state.screen === "intro") return renderIntro();
     if(state.screen === "log") return renderLog();
+    if(state.screen === "chat") return renderChat();
     if(state.screen === "gamemode") return renderGameMode();
   }
 
@@ -927,6 +960,21 @@
 
   function stopMapIfNeeded(){
     if(state.screen !== "map" && state.pollTimer){ clearInterval(state.pollTimer); state.pollTimer = null; }
+  }
+  function stopChatIfNeeded(){
+    if(state.screen !== "chat" && state.chatPollTimer){ clearInterval(state.chatPollTimer); state.chatPollTimer = null; }
+  }
+  // Coupe le micro si on quitte le chat par un autre chemin que le bouton "Retour" (ex. le
+  // bouton retour physique du téléphone) — sinon l'enregistrement continuerait en silence.
+  function stopVoiceIfNeeded(){
+    if(state.screen !== "chat" && state.voiceRecorder){
+      if(state.voiceRecordTimer){ clearInterval(state.voiceRecordTimer); state.voiceRecordTimer = null; }
+      state.voiceChunks = [];
+      if(state.voiceRecorder.state !== "inactive"){ state.voiceRecorder.stop(); }
+      state.voiceRecorder = null;
+      if(state.voiceStream){ state.voiceStream.getTracks().forEach(function(t){ t.stop(); }); state.voiceStream = null; }
+      state.voicePreviewDataUrl = null;
+    }
   }
 
   // ---------- Écran d'introduction cinématique (Bad Brothers) ----------
@@ -1374,6 +1422,7 @@
       state.player.livesRemaining = undefined;
       state.player._wasInSpawn = false;
       state.orgAccessUnlocked = false;
+      state.chatToTeam = null;
       state.screen = "map";
       render();
     }
@@ -3178,6 +3227,191 @@
   }
 
   // ---------- Écran Journal (SOS pour l'instant) ----------
+  // ---------- Écran Chat ----------
+  var VOICE_MAX_SECONDS = 15;
+
+  function renderChat(){
+    if(!state.event) return;
+    if(!state.chatToTeam) state.chatToTeam = state.player.team;
+    app.innerHTML =
+      '<div class="topbar"><button class="back">‹ Retour</button><div class="eyebrow">💬 Chat</div></div>' +
+      '<div id="chat-list" style="max-height:48vh;overflow-y:auto;display:flex;flex-direction:column;gap:6px;"></div>' +
+      '<div id="chat-compose" style="margin-top:8px;"></div>';
+    document.querySelector(".back").onclick = function(){ cancelVoiceRecording(); stopChatPoll(); state.screen="map"; render(); };
+    renderChatComposeArea();
+    loadChatView();
+    startChatPoll();
+  }
+
+  function renderChatComposeArea(){
+    var el = document.getElementById("chat-compose");
+    if(!el || !state.event) return;
+    var teams = (state.event.teams||[]);
+
+    // Aperçu prêt à envoyer : on écoute avant de valider, pour éviter un envoi accidentel.
+    if(state.voicePreviewDataUrl){
+      el.innerHTML =
+        '<audio controls src="'+state.voicePreviewDataUrl+'" style="width:100%;"></audio>' +
+        '<div class="row" style="margin-top:6px;">' +
+          '<button class="btn btn-sm btn-primary" id="btn-voice-send">Envoyer le vocal</button>' +
+          '<button class="btn btn-sm btn-ghost" id="btn-voice-discard">Annuler</button>' +
+        '</div>';
+      document.getElementById("btn-voice-send").onclick = sendCurrentVoiceMessage;
+      document.getElementById("btn-voice-discard").onclick = function(){ state.voicePreviewDataUrl = null; renderChatComposeArea(); };
+      return;
+    }
+
+    // Enregistrement en cours.
+    if(state.voiceRecorder && state.voiceRecorder.state === "recording"){
+      el.innerHTML =
+        '<p class="mono" id="voice-timer" style="color:var(--danger);font-size:13px;">🔴 Enregistrement… 0:00 / 0:'+("0"+VOICE_MAX_SECONDS).slice(-2)+'</p>' +
+        '<div class="row">' +
+          '<button class="btn btn-sm btn-primary" id="btn-voice-stop">Arrêter</button>' +
+          '<button class="btn btn-sm btn-ghost" id="btn-voice-cancel">Annuler</button>' +
+        '</div>';
+      document.getElementById("btn-voice-stop").onclick = stopVoiceRecording;
+      document.getElementById("btn-voice-cancel").onclick = cancelVoiceRecording;
+      return;
+    }
+
+    // État normal : texte + choix du destinataire + micro.
+    el.innerHTML =
+      '<div class="field" style="margin-top:0;"><label>Destinataire</label>' +
+        '<select id="chat-to">' +
+          teams.map(function(t){ return '<option value="'+escapeHtml(t.name)+'"'+(t.name===state.chatToTeam?' selected':'')+'>'+escapeHtml(t.name)+(t.name==="Staff"?" (staff)":"")+'</option>'; }).join("") +
+        '</select>' +
+      '</div>' +
+      '<div class="row" style="margin-top:6px;">' +
+        '<input type="text" id="chat-input" placeholder="Message…" style="flex:1;" />' +
+        '<button class="btn btn-sm btn-ghost" id="btn-voice-start" title="Message vocal">🎙️</button>' +
+        '<button class="btn btn-sm btn-primary" id="btn-chat-send">Envoyer</button>' +
+      '</div>';
+    document.getElementById("chat-to").onchange = function(e){ state.chatToTeam = e.target.value; };
+    document.getElementById("btn-chat-send").onclick = sendCurrentChatMessage;
+    document.getElementById("btn-voice-start").onclick = startVoiceRecording;
+    document.getElementById("chat-input").addEventListener("keydown", function(e){ if(e.key === "Enter") sendCurrentChatMessage(); });
+  }
+
+  async function sendCurrentChatMessage(){
+    var input = document.getElementById("chat-input");
+    if(!input) return;
+    var text = input.value.trim();
+    if(!text || !state.event) return;
+    input.value = "";
+    await sendChatMessage(state.event.code, state.chatToTeam, text, null);
+    loadChatView();
+  }
+
+  // ---------- Messages vocaux (enregistrement local, pas de temps réel — voir explication ----------
+  // à l'utilisateur : un vrai chat vocal en direct demanderait un serveur dédié, hors de
+  // portée de cette architecture GitHub Pages + Firebase. Ceci enregistre un court message,
+  // l'envoie comme une pièce jointe audio dans le chat existant.
+  function pickAudioMimeType(){
+    var candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"];
+    for(var i=0;i<candidates.length;i++){
+      if(window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(candidates[i])) return candidates[i];
+    }
+    return "";
+  }
+
+  async function startVoiceRecording(){
+    if(!navigator.mediaDevices || !window.MediaRecorder){
+      alert("Enregistrement audio non pris en charge par ce navigateur.");
+      return;
+    }
+    try{
+      var stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      state.voiceStream = stream;
+      var mimeType = pickAudioMimeType();
+      var recorder = mimeType ? new MediaRecorder(stream, { mimeType: mimeType }) : new MediaRecorder(stream);
+      state.voiceChunks = [];
+      recorder.ondataavailable = function(e){ if(e.data && e.data.size) state.voiceChunks.push(e.data); };
+      recorder.onstop = function(){
+        if(state.voiceStream){ state.voiceStream.getTracks().forEach(function(t){ t.stop(); }); state.voiceStream = null; }
+        if(!state.voiceChunks.length) return; // annulé avant la moindre donnée : rien à faire
+        var blob = new Blob(state.voiceChunks, { type: recorder.mimeType || "audio/webm" });
+        var reader = new FileReader();
+        reader.onload = function(ev){
+          state.voicePreviewDataUrl = ev.target.result;
+          renderChatComposeArea();
+        };
+        reader.readAsDataURL(blob);
+      };
+      state.voiceRecorder = recorder;
+      state.voiceRecordStart = Date.now();
+      recorder.start();
+      renderChatComposeArea();
+      state.voiceRecordTimer = setInterval(function(){
+        var elapsed = (Date.now() - state.voiceRecordStart) / 1000;
+        var timerEl = document.getElementById("voice-timer");
+        if(timerEl){
+          var s = Math.floor(elapsed);
+          timerEl.textContent = "🔴 Enregistrement… 0:" + ("0"+s).slice(-2) + " / 0:" + ("0"+VOICE_MAX_SECONDS).slice(-2);
+        }
+        if(elapsed >= VOICE_MAX_SECONDS) stopVoiceRecording();
+      }, 250);
+    }catch(e){
+      alert("Impossible d\u2019accéder au micro (autorisation refusée ?).");
+    }
+  }
+
+  function stopVoiceRecording(){
+    if(state.voiceRecordTimer){ clearInterval(state.voiceRecordTimer); state.voiceRecordTimer = null; }
+    if(state.voiceRecorder && state.voiceRecorder.state !== "inactive"){ state.voiceRecorder.stop(); }
+  }
+
+  function cancelVoiceRecording(){
+    if(state.voiceRecordTimer){ clearInterval(state.voiceRecordTimer); state.voiceRecordTimer = null; }
+    if(state.voiceRecorder && state.voiceRecorder.state !== "inactive"){
+      state.voiceChunks = []; // vide le buffer pour que onstop ne propose pas d'aperçu
+      state.voiceRecorder.stop();
+    }
+    state.voiceRecorder = null;
+    state.voicePreviewDataUrl = null;
+    renderChatComposeArea();
+  }
+
+  async function sendCurrentVoiceMessage(){
+    if(!state.voicePreviewDataUrl || !state.event) return;
+    var data = state.voicePreviewDataUrl;
+    state.voicePreviewDataUrl = null;
+    renderChatComposeArea();
+    await sendChatMessage(state.event.code, state.chatToTeam, "", data);
+    loadChatView();
+  }
+
+  async function loadChatView(){
+    var el = document.getElementById("chat-list");
+    if(!el || !state.event) return;
+    var chat = await loadChat(state.event.code);
+    var amPrivileged = state.isOrganizer || state.player.role === "staff";
+    var myTeam = state.player.team;
+    var entries = chat.filter(function(m){
+      return amPrivileged || m.to === myTeam || m.fromTeam === myTeam;
+    });
+    if(!entries.length){ el.innerHTML = '<p>Aucun message pour l\u2019instant.</p>'; return; }
+    var wasNearBottom = (el.scrollTop + el.clientHeight >= el.scrollHeight - 30);
+    el.innerHTML = entries.map(function(m){
+      var d = new Date(m.ts);
+      var hh = ("0"+d.getHours()).slice(-2), mm = ("0"+d.getMinutes()).slice(-2);
+      var toLabel = (m.to && m.to !== m.fromTeam) ? (' \u2192 '+escapeHtml(m.to)) : '';
+      return '<div class="zone-row" style="flex-direction:column;align-items:flex-start;gap:2px;">' +
+        '<span class="mono" style="font-size:10px;color:var(--ink-dim);">'+escapeHtml(m.from||"?")+' ('+escapeHtml(m.fromTeam||"?")+')'+toLabel+' \u00b7 '+hh+':'+mm+'</span>' +
+        (m.audio ? ('<audio controls src="'+m.audio+'" style="width:100%;height:32px;margin-top:2px;"></audio>') : '') +
+        (m.text ? ('<span>'+escapeHtml(m.text)+'</span>') : '') +
+      '</div>';
+    }).join("");
+    if(wasNearBottom) el.scrollTop = el.scrollHeight;
+  }
+
+  function startChatPoll(){
+    stopChatPoll();
+    state.chatPollTimer = setInterval(loadChatView, 4000);
+  }
+  function stopChatPoll(){
+    if(state.chatPollTimer){ clearInterval(state.chatPollTimer); state.chatPollTimer = null; }
+  }
+
   function renderLog(){
     var amPrivileged = state.isOrganizer || state.player.role === "staff";
     app.innerHTML =
@@ -3315,6 +3549,116 @@
   }
 
   // ---------- Panneau de configuration du Scénario personnalisé (organisateur) ----------
+  // ---------- Générateur automatique de scénario (basé sur des règles, pas une IA) ----------
+  // Aucune clé API, aucun serveur externe : uniquement des règles simples appliquées à la
+  // carte déjà chargée (bâtiments existants) et aux équipes de l'événement.
+  function buildingCentroid(z){
+    var sx = 0, sy = 0;
+    z.points.forEach(function(p){ sx += p[0]; sy += p[1]; });
+    return [sx / z.points.length, sy / z.points.length];
+  }
+
+  // Sélection gloutonne "point le plus éloigné" : choisit des bâtiments bien répartis sur
+  // la carte plutôt que regroupés au même endroit.
+  function pickSpreadBuildings(buildings, count){
+    if(buildings.length <= count) return buildings.slice();
+    var withCentroid = buildings.map(function(b){ return { z:b, c: buildingCentroid(b) }; });
+    var chosen = [withCentroid[Math.floor(Math.random()*withCentroid.length)]];
+    var remaining = withCentroid.filter(function(w){ return w !== chosen[0]; });
+    while(chosen.length < count && remaining.length){
+      var best = null, bestDist = -1;
+      remaining.forEach(function(w){
+        var minDist = Math.min.apply(null, chosen.map(function(c){ return distanceMeters(w.c[0], w.c[1], c.c[0], c.c[1]); }));
+        if(minDist > bestDist){ bestDist = minDist; best = w; }
+      });
+      chosen.push(best);
+      remaining = remaining.filter(function(w){ return w !== best; });
+    }
+    return chosen.map(function(w){ return w.z; });
+  }
+
+  function computeAutoScenarioPlan(zones, playerCount, durationMinutes){
+    var buildings = zones.filter(function(z){ return (z.kind === "building" || !z.kind) && isValidZone(z); });
+    var teams = (state.event.teams||[]).filter(function(t){ return t.name !== "Staff"; });
+    if(!buildings.length) return { error: "Aucun bâtiment sur cette carte — ajoute-en depuis l\u2019éditeur avant de générer un scénario." };
+    if(teams.length < 1) return { error: "Aucune équipe définie pour cet événement." };
+
+    var flagCount = playerCount <= 12 ? 1 : (playerCount <= 24 ? 2 : 3);
+    flagCount = Math.min(flagCount, buildings.length);
+    var mode = playerCount <= 12 ? "symmetric" : (playerCount <= 24 ? "asymmetric" : "battle_royale");
+    var chosen = pickSpreadBuildings(buildings, flagCount);
+
+    // Estimation grossière : ~55% de la durée demandée en capture active, le reste pour les
+    // déplacements et le regroupement. Basé sur une escouade moyenne répartie sur les
+    // drapeaux — à ajuster ensuite via les réglages capture & score si besoin.
+    var activeMinutes = Math.max(2, durationMinutes * 0.55);
+    var avgPushSize = Math.max(1, Math.round(playerCount / (teams.length * flagCount)));
+    var mult = 1 + 0.1 * Math.min(avgPushSize - 1, 10);
+    var captureBaseMinutes = Math.max(2, Math.round(activeMinutes * mult));
+
+    var attacker = teams[0];
+    var objectives = chosen.map(function(b){
+      return {
+        title: "Capturer " + b.name,
+        buildingRef: b,
+        requiredTeam: mode === "asymmetric" ? attacker.name : null
+      };
+    });
+
+    var triggerGas = null;
+    if(mode === "battle_royale"){
+      var remainingMinutes = Math.max(3, durationMinutes - activeMinutes);
+      triggerGas = {
+        initialRadius: 15, growAmount: 20, phaseMinutes: Math.max(1, Math.round(remainingMinutes / 4)), maxRadius: null
+      };
+    }
+
+    return {
+      mode: mode, flagCount: flagCount, objectives: objectives, captureBaseMinutes: captureBaseMinutes,
+      timeLimitMinutes: durationMinutes, triggerGas: triggerGas, attacker: mode === "asymmetric" ? attacker.name : null,
+      teamsCount: teams.length, avgPushSize: avgPushSize
+    };
+  }
+
+  function describeAutoScenarioPlan(plan){
+    var modeLabel = plan.mode === "symmetric" ? "Capture symétrique" : (plan.mode === "asymmetric" ? "Attaque / Défense" : "Battle Royale (gaz)");
+    var lines = [];
+    lines.push("<b>Mode : " + modeLabel + "</b>");
+    plan.objectives.forEach(function(o){
+      lines.push("🚩 " + escapeHtml(o.buildingRef.name) + (o.requiredTeam ? (" — à capturer par " + escapeHtml(o.requiredTeam)) : " — première équipe à s\u2019y établir"));
+    });
+    lines.push("Temps de capture de base estimé : ~" + plan.captureBaseMinutes + " min (pour une pouss\u00e9e moyenne de " + plan.avgPushSize + " joueur(s))");
+    lines.push("Limite de temps de la partie : " + plan.timeLimitMinutes + " min");
+    if(plan.triggerGas) lines.push("☣️ Un gaz se déclenchera automatiquement une fois les objectifs atteints, pour forcer la confrontation finale.");
+    lines.push('<span style="color:var(--ink-dim);font-size:11px;">Estimation approximative — ajustable ensuite dans "Réglages capture &amp; score".</span>');
+    return lines.map(function(l){ return '<p style="margin-top:4px;">'+l+'</p>'; }).join("");
+  }
+
+  async function applyAutoScenarioPlan(plan, zones){
+    var code = state.event.code;
+    var createdObjectives = [];
+    for(var i=0; i<plan.objectives.length; i++){
+      var o = plan.objectives[i];
+      var flagZone = {
+        id: genId("f"), kind: "drapeau", name: o.buildingRef.name, points: o.buildingRef.points,
+        captureOwner: null, captureTarget: null, captureProgress: 0, captureLastTick: null
+      };
+      zones.push(flagZone);
+      createdObjectives.push({
+        id: genId("obj"), title: o.title, linkedFlagId: flagZone.id,
+        requiredTeam: o.requiredTeam, completed: false, completedAt: null
+      });
+    }
+    await saveZones(code, zones);
+
+    if(!state.event.scenario) state.event.scenario = { objectives: [], triggerGas: null, triggered: false };
+    state.event.scenario.objectives = state.event.scenario.objectives.concat(createdObjectives);
+    if(plan.triggerGas) state.event.scenario.triggerGas = plan.triggerGas;
+    state.event.captureBaseMinutes = plan.captureBaseMinutes;
+    state.event.timeLimitMinutes = plan.timeLimitMinutes;
+    await saveEventConfig(state.event);
+  }
+
   function renderScenarioPanel(zones){
     var el = document.getElementById("scenario-panel");
     if(!el || !state.event) return;
@@ -3365,10 +3709,41 @@
     }
 
     el.innerHTML =
+      '<div class="panel" style="background:rgba(201,162,39,.06);">' +
+        '<label class="mono" style="font-size:10px;color:var(--ink-dim);text-transform:uppercase;">🎲 Générer automatiquement</label>' +
+        '<p style="margin-top:4px;font-size:12px;">Basé sur des règles (pas une IA) : place des drapeaux sur des bâtiments existants et règle les temps de capture selon le nombre de joueurs et la durée souhaitée.</p>' +
+        '<div class="field" style="margin-top:6px;"><label>Nombre de joueurs</label><input type="number" id="auto-sc-players" value="20" min="2" /></div>' +
+        '<div class="field"><label>Durée souhaitée (minutes)</label><input type="number" id="auto-sc-duration" value="30" min="5" /></div>' +
+        '<button class="btn btn-sm btn-ghost" id="btn-auto-sc-preview">Générer un aperçu</button>' +
+        '<div id="auto-sc-preview" style="margin-top:8px;"></div>' +
+      '</div>' +
+      '<p class="mono" style="font-size:10px;color:var(--ink-dim);text-transform:uppercase;margin-top:14px;">✍️ Construire à la main</p>' +
       '<div id="sc-objectives">'+objectivesHtml+'</div>' +
       addFormHtml +
       '<p class="mono" style="font-size:10px;color:var(--ink-dim);text-transform:uppercase;margin-top:12px;">Déclenchement final (optionnel)</p>' +
       triggerHtml;
+
+    document.getElementById("btn-auto-sc-preview").onclick = function(){
+      var players = Math.max(2, parseInt(document.getElementById("auto-sc-players").value, 10) || 20);
+      var duration = Math.max(5, parseInt(document.getElementById("auto-sc-duration").value, 10) || 30);
+      var plan = computeAutoScenarioPlan(zones, players, duration);
+      var previewEl = document.getElementById("auto-sc-preview");
+      if(plan.error){
+        previewEl.innerHTML = '<p style="color:var(--amber);font-size:12px;">'+escapeHtml(plan.error)+'</p>';
+        return;
+      }
+      previewEl.innerHTML = describeAutoScenarioPlan(plan) +
+        '<div class="row" style="margin-top:8px;">' +
+          '<button class="btn btn-sm btn-primary" id="btn-auto-sc-apply">Appliquer ce scénario</button>' +
+          '<button class="btn btn-sm btn-ghost" id="btn-auto-sc-cancel">Annuler</button>' +
+        '</div>';
+      document.getElementById("btn-auto-sc-cancel").onclick = function(){ previewEl.innerHTML = ""; };
+      document.getElementById("btn-auto-sc-apply").onclick = async function(){
+        previewEl.innerHTML = '<p class="mono" style="font-size:11px;color:var(--ink-dim);">Application…</p>';
+        await applyAutoScenarioPlan(plan, zones);
+        loadGameModeSummary();
+      };
+    };
 
     document.getElementById("btn-sc-add").onclick = async function(){
       var title = document.getElementById("sc-new-title").value.trim();
@@ -3497,6 +3872,7 @@
         '<button class="btn btn-sm btn-ghost" id="btn-ping-menu">📍 Ping</button>' +
         '<button class="btn btn-sm '+(state.trailDuration?'btn-primary':'btn-ghost')+'" id="btn-trail-menu">🛤️ Trajectoire</button>' +
         '<button class="btn btn-sm btn-ghost" id="btn-log-player">📋 Journal</button>' +
+        '<button class="btn btn-sm btn-ghost" id="btn-chat-player">💬 Chat</button>' +
       '</div>' +
       '<div id="ping-menu"></div>' +
       '<div id="trail-menu"></div>' +
@@ -3582,6 +3958,11 @@
     document.getElementById("btn-log-player").onclick = function(){
       teardownMap();
       state.screen = "log";
+      render();
+    };
+    document.getElementById("btn-chat-player").onclick = function(){
+      teardownMap();
+      state.screen = "chat";
       render();
     };
 
