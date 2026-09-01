@@ -446,7 +446,7 @@
     orgAccessUnlocked: false,
     pingPlacingKind: null,
     chatPollTimer: null,
-    chatToTeam: null,
+    chatChannel: null,
     voiceRecorder: null,
     voiceChunks: [],
     voiceStream: null,
@@ -1422,7 +1422,7 @@
       state.player.livesRemaining = undefined;
       state.player._wasInSpawn = false;
       state.orgAccessUnlocked = false;
-      state.chatToTeam = null;
+      state.chatChannel = null;
       state.screen = "map";
       render();
     }
@@ -3232,12 +3232,19 @@
 
   function renderChat(){
     if(!state.event) return;
-    if(!state.chatToTeam) state.chatToTeam = state.player.team;
+    if(!state.chatChannel) state.chatChannel = "team";
+    var amPrivileged = state.isOrganizer || state.player.role === "staff";
     app.innerHTML =
       '<div class="topbar"><button class="back">‹ Retour</button><div class="eyebrow">💬 Chat</div></div>' +
-      '<div id="chat-list" style="max-height:48vh;overflow-y:auto;display:flex;flex-direction:column;gap:6px;"></div>' +
+      '<div class="row" style="margin-top:6px;">' +
+        '<button class="btn btn-sm '+(state.chatChannel==="team"?"btn-primary":"btn-ghost")+'" id="btn-chat-tab-team">'+(amPrivileged?"Toutes équipes":("🔒 "+escapeHtml(state.player.team||"Équipe")))+'</button>' +
+        '<button class="btn btn-sm '+(state.chatChannel==="global"?"btn-primary":"btn-ghost")+'" id="btn-chat-tab-global">🌐 Global</button>' +
+      '</div>' +
+      '<div id="chat-list" style="max-height:46vh;overflow-y:auto;display:flex;flex-direction:column;gap:6px;margin-top:8px;"></div>' +
       '<div id="chat-compose" style="margin-top:8px;"></div>';
     document.querySelector(".back").onclick = function(){ cancelVoiceRecording(); stopChatPoll(); state.screen="map"; render(); };
+    document.getElementById("btn-chat-tab-team").onclick = function(){ state.chatChannel = "team"; renderChat(); };
+    document.getElementById("btn-chat-tab-global").onclick = function(){ state.chatChannel = "global"; renderChat(); };
     renderChatComposeArea();
     loadChatView();
     startChatPoll();
@@ -3246,7 +3253,6 @@
   function renderChatComposeArea(){
     var el = document.getElementById("chat-compose");
     if(!el || !state.event) return;
-    var teams = (state.event.teams||[]);
 
     // Aperçu prêt à envoyer : on écoute avant de valider, pour éviter un envoi accidentel.
     if(state.voicePreviewDataUrl){
@@ -3274,19 +3280,15 @@
       return;
     }
 
-    // État normal : texte + choix du destinataire + micro.
+    // État normal : texte + micro. Le destinataire est l'onglet actif, plus besoin de le
+    // choisir à chaque message (source de confusion avant).
+    var placeholder = state.chatChannel === "global" ? "Message à tout le monde…" : "Message à ton équipe…";
     el.innerHTML =
-      '<div class="field" style="margin-top:0;"><label>Destinataire</label>' +
-        '<select id="chat-to">' +
-          teams.map(function(t){ return '<option value="'+escapeHtml(t.name)+'"'+(t.name===state.chatToTeam?' selected':'')+'>'+escapeHtml(t.name)+(t.name==="Staff"?" (staff)":"")+'</option>'; }).join("") +
-        '</select>' +
-      '</div>' +
-      '<div class="row" style="margin-top:6px;">' +
-        '<input type="text" id="chat-input" placeholder="Message…" style="flex:1;" />' +
+      '<div class="row">' +
+        '<input type="text" id="chat-input" placeholder="'+placeholder+'" style="flex:1;" />' +
         '<button class="btn btn-sm btn-ghost" id="btn-voice-start" title="Message vocal">🎙️</button>' +
         '<button class="btn btn-sm btn-primary" id="btn-chat-send">Envoyer</button>' +
       '</div>';
-    document.getElementById("chat-to").onchange = function(e){ state.chatToTeam = e.target.value; };
     document.getElementById("btn-chat-send").onclick = sendCurrentChatMessage;
     document.getElementById("btn-voice-start").onclick = startVoiceRecording;
     document.getElementById("chat-input").addEventListener("keydown", function(e){ if(e.key === "Enter") sendCurrentChatMessage(); });
@@ -3298,7 +3300,8 @@
     var text = input.value.trim();
     if(!text || !state.event) return;
     input.value = "";
-    await sendChatMessage(state.event.code, state.chatToTeam, text, null);
+    var to = state.chatChannel === "global" ? "global" : state.player.team;
+    await sendChatMessage(state.event.code, to, text, null);
     loadChatView();
   }
 
@@ -3376,7 +3379,8 @@
     var data = state.voicePreviewDataUrl;
     state.voicePreviewDataUrl = null;
     renderChatComposeArea();
-    await sendChatMessage(state.event.code, state.chatToTeam, "", data);
+    var to = state.chatChannel === "global" ? "global" : state.player.team;
+    await sendChatMessage(state.event.code, to, "", data);
     loadChatView();
   }
 
@@ -3386,17 +3390,26 @@
     var chat = await loadChat(state.event.code);
     var amPrivileged = state.isOrganizer || state.player.role === "staff";
     var myTeam = state.player.team;
-    var entries = chat.filter(function(m){
-      return amPrivileged || m.to === myTeam || m.fromTeam === myTeam;
-    });
+    var entries;
+    if(state.chatChannel === "global"){
+      entries = chat.filter(function(m){ return m.to === "global"; });
+    } else {
+      // Canal "équipe" : privé — un joueur simple ne voit que sa propre équipe. Le
+      // staff/organisateur voit toutes les équipes (comme le Journal général).
+      entries = chat.filter(function(m){
+        if(m.to === "global") return false;
+        return amPrivileged || m.to === myTeam;
+      });
+    }
     if(!entries.length){ el.innerHTML = '<p>Aucun message pour l\u2019instant.</p>'; return; }
     var wasNearBottom = (el.scrollTop + el.clientHeight >= el.scrollHeight - 30);
+    var showTeamTag = amPrivileged && state.chatChannel === "team";
     el.innerHTML = entries.map(function(m){
       var d = new Date(m.ts);
       var hh = ("0"+d.getHours()).slice(-2), mm = ("0"+d.getMinutes()).slice(-2);
-      var toLabel = (m.to && m.to !== m.fromTeam) ? (' \u2192 '+escapeHtml(m.to)) : '';
+      var teamTag = showTeamTag ? (' ('+escapeHtml(m.fromTeam||"?")+')') : '';
       return '<div class="zone-row" style="flex-direction:column;align-items:flex-start;gap:2px;">' +
-        '<span class="mono" style="font-size:10px;color:var(--ink-dim);">'+escapeHtml(m.from||"?")+' ('+escapeHtml(m.fromTeam||"?")+')'+toLabel+' \u00b7 '+hh+':'+mm+'</span>' +
+        '<span class="mono" style="font-size:10px;color:var(--ink-dim);">'+escapeHtml(m.from||"?")+teamTag+' \u00b7 '+hh+':'+mm+'</span>' +
         (m.audio ? ('<audio controls src="'+m.audio+'" style="width:100%;height:32px;margin-top:2px;"></audio>') : '') +
         (m.text ? ('<span>'+escapeHtml(m.text)+'</span>') : '') +
       '</div>';
