@@ -444,6 +444,7 @@
     cachedZones: [],
     modAuthed: false,
     orgAccessUnlocked: false,
+    pingPlacingKind: null,
     batteryLevel: null,
     batterySaverMode: false,
     batteryWatched: false,
@@ -673,7 +674,9 @@
       id: genId("ping"), kind: kindDef.kind, emoji: kindDef.emoji, label: kindDef.label,
       lat: lat, lng: lng, team: state.player.team || null, playerName: state.player.name || "?", ts: now
     });
-    return storageSet(eventPingsKey(code), JSON.stringify(pings));
+    var ok = await storageSet(eventPingsKey(code), JSON.stringify(pings));
+    appendEventLog(code, { ts: now, type: "ping", name: state.player.name || "?", team: state.player.team || null, detail: kindDef.emoji + " " + kindDef.label });
+    return ok;
   }
 
   async function loadEventConfig(code){
@@ -3176,11 +3179,29 @@
 
   // ---------- Écran Journal (SOS pour l'instant) ----------
   function renderLog(){
+    var amPrivileged = state.isOrganizer || state.player.role === "staff";
     app.innerHTML =
-      '<div class="topbar"><button class="back">‹ Retour</button><div class="eyebrow">Journal — SOS</div></div>' +
-      '<div id="log-list"></div>';
+      '<div class="topbar"><button class="back">‹ Retour</button><div class="eyebrow">'+(amPrivileged ? "Journal général" : "Journal")+'</div></div>' +
+      (amPrivileged ? '<p style="margin-top:4px;">Tout ce qui se passe sur le terrain, toutes équipes confondues.</p>'
+        : '<p style="margin-top:4px;">Ce qui concerne ton équipe ('+escapeHtml(state.player.team||"?")+'), plus les événements généraux (scénario, gaz).</p>') +
+      '<div id="log-list" style="margin-top:8px;"></div>';
     document.querySelector(".back").onclick = function(){ state.screen="map"; render(); };
     loadLog();
+  }
+
+  function renderLogEntry(e){
+    var d = new Date(e.ts);
+    var hh = ("0"+d.getHours()).slice(-2), mm = ("0"+d.getMinutes()).slice(-2);
+    var label;
+    if(e.type === "sos") label = "🆘 SOS déclenché par "+escapeHtml(e.name);
+    else if(e.type === "sos_resolved") label = "✓ SOS résolu par "+escapeHtml(e.name);
+    else if(e.type === "flag_capture") label = "🚩 "+escapeHtml(e.team||"?")+" capture "+escapeHtml(e.name);
+    else if(e.type === "ping") label = "📍 "+escapeHtml(e.name)+" ("+escapeHtml(e.team||"?")+") : "+(e.detail||"");
+    else if(e.type === "deathmatch_out") label = "☠️ "+escapeHtml(e.name)+" éliminé"+(e.team?(" ("+escapeHtml(e.team)+")"):"");
+    else if(e.type === "objective_complete") label = "📂 Objectif atteint : "+escapeHtml(e.name);
+    else if(e.type === "gas_triggered") label = "☣️ Gaz déclenché (scénario terminé)";
+    else label = escapeHtml(e.type||"événement");
+    return '<div class="zone-row"><span class="name">'+label+'</span><span class="mono" style="font-size:10px;color:var(--ink-dim);">'+hh+':'+mm+'</span></div>';
   }
 
   async function loadLog(){
@@ -3188,14 +3209,13 @@
     if(!el || !state.event) return;
     el.innerHTML = '<p class="mono" style="font-size:11px;color:var(--ink-dim);">Chargement…</p>';
     var log = await loadEventLog(state.event.code);
-    var entries = log.filter(function(e){ return e.type === "sos" || e.type === "sos_resolved"; }).slice().reverse();
-    if(!entries.length){ el.innerHTML = '<p>Aucun événement SOS pour l\u2019instant.</p>'; return; }
-    el.innerHTML = entries.map(function(e){
-      var d = new Date(e.ts);
-      var hh = ("0"+d.getHours()).slice(-2), mm = ("0"+d.getMinutes()).slice(-2);
-      var label = e.type === "sos" ? ("🆘 SOS déclenché par "+escapeHtml(e.name)) : ("✓ SOS résolu par "+escapeHtml(e.name));
-      return '<div class="zone-row"><span class="name">'+label+'</span><span class="mono" style="font-size:10px;color:var(--ink-dim);">'+hh+':'+mm+'</span></div>';
-    }).join("");
+    var amPrivileged = state.isOrganizer || state.player.role === "staff";
+    var myTeam = state.player.team;
+    var entries = log.filter(function(e){
+      return amPrivileged || !e.team || e.team === myTeam;
+    }).slice().reverse();
+    if(!entries.length){ el.innerHTML = '<p>Rien à afficher pour l\u2019instant.</p>'; return; }
+    el.innerHTML = entries.map(renderLogEntry).join("");
   }
 
   // ---------- Écran Mode de jeu (organisateur ou staff uniquement) ----------
@@ -3405,18 +3425,21 @@
     var scenario = state.event.scenario;
     if(!scenario.objectives || !scenario.objectives.length) return null;
     var changed = false;
+    var completedTitles = [];
     scenario.objectives.forEach(function(o){
       if(o.completed || !o.linkedFlagId) return;
       var z = zones.find(function(zz){ return zz.id === o.linkedFlagId; });
       if(!z) return;
       var ownerOk = o.requiredTeam ? (z.captureOwner === o.requiredTeam) : !!z.captureOwner;
-      if(ownerOk){ o.completed = true; o.completedAt = Date.now(); changed = true; }
+      if(ownerOk){ o.completed = true; o.completedAt = Date.now(); changed = true; completedTitles.push(o.title); }
     });
     var allDone = scenario.objectives.every(function(o){ return o.completed; });
     var newGasZone = null;
+    var gasTriggered = false;
     if(allDone && scenario.triggerGas && !scenario.triggered){
       scenario.triggered = true;
       changed = true;
+      gasTriggered = true;
       var g = scenario.triggerGas;
       newGasZone = {
         id: genId("gas"), kind: "gaz", name: "Gaz (scénario)", center: state.event.center,
@@ -3424,7 +3447,7 @@
         maxRadius: g.maxRadius || null, startAt: Date.now(), frozenRadius: null
       };
     }
-    return changed ? { newGasZone: newGasZone } : null;
+    return changed ? { newGasZone: newGasZone, completedTitles: completedTitles, gasTriggered: gasTriggered } : null;
   }
 
   function updateScenarioBanner(){
@@ -3473,6 +3496,7 @@
         '<button class="btn btn-sm '+(state.player.sos?'btn-danger':'btn-ghost')+'" id="btn-sos">'+(state.player.sos?'🆘 Annuler la demande d\u2019aide':'🆘 Demander de l\u2019aide')+'</button>' +
         '<button class="btn btn-sm btn-ghost" id="btn-ping-menu">📍 Ping</button>' +
         '<button class="btn btn-sm '+(state.trailDuration?'btn-primary':'btn-ghost')+'" id="btn-trail-menu">🛤️ Trajectoire</button>' +
+        '<button class="btn btn-sm btn-ghost" id="btn-log-player">📋 Journal</button>' +
       '</div>' +
       '<div id="ping-menu"></div>' +
       '<div id="trail-menu"></div>' +
@@ -3520,13 +3544,13 @@
       btn.textContent = state.player.sos ? "🆘 Annuler la demande d\u2019aide" : "🆘 Demander de l\u2019aide";
       if(state.event && state.player.name){
         await upsertPlayer(state.event.code, state.playerId, { sos: state.player.sos });
-        await appendEventLog(state.event.code, { ts: Date.now(), type: state.player.sos ? "sos" : "sos_resolved", name: state.player.name });
+        await appendEventLog(state.event.code, { ts: Date.now(), type: state.player.sos ? "sos" : "sos_resolved", name: state.player.name, team: state.player.team });
       }
     };
 
     document.getElementById("btn-ping-menu").onclick = function(){
       var el = document.getElementById("ping-menu");
-      if(el.dataset.open === "1"){ el.innerHTML = ""; el.dataset.open = ""; return; }
+      if(el.dataset.open === "1"){ el.innerHTML = ""; el.dataset.open = ""; state.pingPlacingKind = null; return; }
       el.dataset.open = "1";
       el.innerHTML = '<div class="ping-grid">' +
         PING_KINDS.map(function(k){
@@ -3534,16 +3558,17 @@
         }).join("") +
       '</div>';
       Array.prototype.forEach.call(el.querySelectorAll(".ping-btn"), function(btn){
-        btn.onclick = async function(){
-          if(!state.lastCoords){
-            el.innerHTML = '<p style="font-size:11px;color:var(--amber);">Position pas encore connue — attends le signal GPS.</p>';
-            return;
-          }
+        btn.onclick = function(){
           var kindDef = PING_KINDS.filter(function(k){ return k.kind === btn.dataset.kind; })[0];
-          if(kindDef && state.event) await addPing(state.event.code, kindDef, state.lastCoords.lat, state.lastCoords.lng);
-          el.innerHTML = "";
-          el.dataset.open = "";
-          refreshPings();
+          if(!kindDef) return;
+          state.pingPlacingKind = kindDef;
+          el.innerHTML = '<p class="mono" style="font-size:11px;color:var(--amber);">'+kindDef.emoji+' Touche la carte pour placer « '+escapeHtml(kindDef.label)+' ».</p>' +
+            '<button class="btn btn-sm btn-ghost" id="btn-ping-cancel">Annuler</button>';
+          document.getElementById("btn-ping-cancel").onclick = function(){
+            state.pingPlacingKind = null;
+            el.innerHTML = "";
+            el.dataset.open = "";
+          };
         };
       });
     };
@@ -3553,6 +3578,11 @@
       if(el.dataset.open === "1"){ el.innerHTML = ""; el.dataset.open = ""; return; }
       el.dataset.open = "1";
       renderTrailMenu();
+    };
+    document.getElementById("btn-log-player").onclick = function(){
+      teardownMap();
+      state.screen = "log";
+      render();
     };
 
     if(!LIBS_OK.leaflet){
@@ -3574,6 +3604,14 @@
     setTimeout(function(){ if(state.map) state.map.invalidateSize(); }, 100);
 
     map.on('click', function(e){
+      if(state.pingPlacingKind){
+        var kindDef = state.pingPlacingKind;
+        state.pingPlacingKind = null;
+        var pingMenuEl = document.getElementById("ping-menu");
+        if(pingMenuEl){ pingMenuEl.innerHTML = ""; pingMenuEl.dataset.open = ""; }
+        if(state.event) addPing(state.event.code, kindDef, e.latlng.lat, e.latlng.lng).then(refreshPings);
+        return;
+      }
       if(!state.testMode) return;
       state.lastCoords = { lat: e.latlng.lat, lng: e.latlng.lng };
       setStatus(true, "Position définie (mode test)");
@@ -3847,6 +3885,9 @@
         if(inSpawn && !state.player._wasInSpawn && state.player.livesRemaining > 0){
           payload.livesRemaining = state.player.livesRemaining - 1;
           state.player.livesRemaining = payload.livesRemaining;
+          if(payload.livesRemaining <= 0){
+            appendEventLog(state.event.code, { ts: Date.now(), type: "deathmatch_out", name: state.player.name, team: state.player.team });
+          }
         }
         state.player._wasInSpawn = inSpawn;
       }
@@ -3886,7 +3927,7 @@
       '<button class="btn btn-ghost btn-sm" id="btn-edit-buildings-live">Éditer la carte</button>' +
       '<button class="btn btn-ghost btn-sm" id="btn-roles-live">Rôles & visibilité</button>' +
       '<button class="btn btn-ghost btn-sm" id="btn-code-live">Code / QR</button>' +
-      '<button class="btn btn-ghost btn-sm" id="btn-log-live">📋 Journal SOS</button>' +
+      '<button class="btn btn-ghost btn-sm" id="btn-log-live">📋 Journal</button>' +
       '<button class="btn btn-ghost btn-sm" id="btn-gamemode-live">🕹 Mode de jeu</button>';
     document.getElementById("btn-edit-buildings-live").onclick = async function(){
       var code = state.event.code;
@@ -3933,7 +3974,7 @@
       '<div class="row" style="margin-top:8px;">' +
         '<button class="btn btn-ghost btn-sm" id="btn-edit-buildings-staff">Éditer la carte</button>' +
         '<button class="btn btn-ghost btn-sm" id="btn-code-staff">Code / QR</button>' +
-        '<button class="btn btn-ghost btn-sm" id="btn-log-staff">📋 Journal SOS</button>' +
+        '<button class="btn btn-ghost btn-sm" id="btn-log-staff">📋 Journal</button>' +
         '<button class="btn btn-ghost btn-sm" id="btn-gamemode-staff">🕹 Mode de jeu</button>' +
       '</div>';
     document.getElementById("staff-visible-toggle").onchange = async function(e){
@@ -4090,6 +4131,7 @@
     var now = Date.now();
     var dirty = false;
     var scoreDelta = {};
+    var captureEvents = [];
     var baseSeconds = ((cfg && cfg.captureBaseMinutes) || 10) * 60;
     var scoreInterval = (cfg && cfg.scoreIntervalSeconds) || 30;
     var scorePerInterval = (cfg && typeof cfg.scorePointsPerInterval === "number") ? cfg.scorePointsPerInterval : 1;
@@ -4132,6 +4174,7 @@
           z.captureOwner = team;
           z.captureProgress = 0;
           z.captureTarget = null;
+          captureEvents.push({ team: team, flagName: z.name });
         }
         dirty = true;
       } else {
@@ -4141,7 +4184,7 @@
         if(z.captureLastTick !== now){ z.captureLastTick = now; dirty = true; }
       }
     });
-    return { dirty: dirty, scoreDelta: scoreDelta };
+    return { dirty: dirty, scoreDelta: scoreDelta, captureEvents: captureEvents };
   }
 
   function updateFlagCaptureBanner(zones){
@@ -4219,6 +4262,9 @@
             await saveScore(state.event.code, score);
             state.cachedScore = score;
           }
+          tick.captureEvents.forEach(function(ev){
+            appendEventLog(state.event.code, { ts: Date.now(), type: "flag_capture", name: ev.flagName, team: ev.team });
+          });
         }
       }
       // Scénario personnalisé : auto-complète les objectifs liés à un drapeau déjà capturé,
@@ -4229,6 +4275,12 @@
         if(scResult.newGasZone){
           zones.push(scResult.newGasZone);
           await saveZones(state.event.code, zones);
+        }
+        scResult.completedTitles.forEach(function(title){
+          appendEventLog(state.event.code, { ts: Date.now(), type: "objective_complete", name: title, team: null });
+        });
+        if(scResult.gasTriggered){
+          appendEventLog(state.event.code, { ts: Date.now(), type: "gas_triggered", name: "Scénario", team: null });
         }
       }
     }
@@ -4703,6 +4755,7 @@
     state.trailLayers = {};
     state.trailDuration = 0;
     state.trailScope = null;
+    state.pingPlacingKind = null;
   }
 
   // Quand l'appli est vraiment fermée (onglet fermé, appli quittée) : on arrête le GPS et les
