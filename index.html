@@ -529,7 +529,10 @@
     { key: "drapeau", label: "Drapeau", emoji: "🚩", colorable: true, defaultColor: "#c9a227" },
     { key: "cadeau",  label: "Cadeau",  emoji: "🎁", colorable: true, defaultColor: "#8e5fc9" },
     { key: "cible",   label: "Cible prioritaire", emoji: "👑", colorable: true, defaultColor: "#d9a62e" },
-    { key: "feu",     label: "Feu (détruit)", emoji: "🔥", colorable: false, defaultColor: "#b3402f" }
+    { key: "feu",     label: "Feu (détruit)", emoji: "🔥", colorable: false, defaultColor: "#b3402f" },
+    { key: "objectif", label: "Objectif", emoji: "🎯", colorable: true, defaultColor: "#3b82c4" },
+    { key: "bombe",   label: "Bombe", emoji: "💣", colorable: false, defaultColor: "#2b2f22" },
+    { key: "objet",   label: "Objet", emoji: "📦", colorable: true, defaultColor: "#8b6b3f" }
   ];
   var FLAG_COLORS = ["#e03c31", "#3ca55c", "#3b82c4", "#d9a62e", "#e8e6d9", "#2b2f22"];
   function pointIconInfo(key){
@@ -601,7 +604,10 @@
   // ---------- Loupe (aide à la précision, carte en direct ET éditeur) ----------
   // Petite carte secondaire zoomée davantage, qui suit le centre de la carte principale —
   // pratique quand plusieurs marqueurs/points sont proches, ou pour tracer précisément.
-  function createLoupe(mainMap, panelId){
+  // zoneSource : fonction qui renvoie le tableau de zones à dessiner sur la loupe (les mêmes
+  // que la carte principale) — sans ça, la loupe montre un fond de carte nu, sans les
+  // bâtiments/points/drapeaux, ce qui la rend inutile pour la précision de placement.
+  function createLoupe(mainMap, panelId, zoneSource){
     var panel = document.getElementById(panelId);
     if(!panel || !mainMap) return null;
     panel.innerHTML = '<div style="width:100%;height:100%;" id="'+panelId+'-inner"></div>';
@@ -610,10 +616,25 @@
       doubleClickZoom:false, touchZoom:false, boxZoom:false, keyboard:false, tap:false
     }).setView(mainMap.getCenter(), Math.min(19, mainMap.getZoom()+3));
     createCachedTileLayer().addTo(loupeMap);
+    var zoneLayers = [];
+    var redrawZones = function(){
+      zoneLayers.forEach(function(l){ loupeMap.removeLayer(l); });
+      zoneLayers = [];
+      if(!zoneSource) return;
+      (zoneSource() || []).forEach(function(z){
+        if(!isValidZone(z)) return;
+        try{ zoneLayers.push(addZoneLayer(loupeMap, z)); }catch(e){ /* une zone corrompue ne doit pas bloquer les autres */ }
+      });
+    };
     var sync = function(){
-      loupeMap.setView(mainMap.getCenter(), Math.min(19, mainMap.getZoom()+3));
+      // { animate:false } : un recentrage instantané, sans easing — l'ancienne version
+      // laissait la loupe "flotter" en retard sur la carte principale, ce qui donnait
+      // l'impression d'un comportement aléatoire.
+      loupeMap.setView(mainMap.getCenter(), Math.min(19, mainMap.getZoom()+3), { animate:false });
+      redrawZones();
     };
     mainMap.on('move zoom', sync);
+    sync();
     return {
       destroy: function(){
         mainMap.off('move zoom', sync);
@@ -1651,7 +1672,6 @@
       '<p style="margin-top:4px;">Touche un bâtiment, une limite ou un point sur la carte pour faire apparaître ses poignées et le modifier. Touche-le à nouveau pour les cacher.</p>' +
       '<div class="editor-toolbar" id="editor-toolbar"></div>' +
       '<div class="zone-list" id="zone-list"></div>' +
-      '<div id="capture-settings-panel"></div>' +
       '<div class="row" style="margin-top:12px;">' +
         '<button class="btn btn-sm btn-ghost" id="btn-load-map">Charger une carte</button>' +
         '<button class="btn btn-sm btn-ghost" id="btn-save-map">Enregistrer comme modèle</button>' +
@@ -1689,7 +1709,7 @@
         panel.classList.add("active");
         btn.classList.add("active");
         setTimeout(function(){
-          state.loupeEditor = createLoupe(state.editorMap, "loupe-panel-editor");
+          state.loupeEditor = createLoupe(state.editorMap, "loupe-panel-editor", function(){ return state.editorZones; });
         }, 50);
       }
     };
@@ -1697,7 +1717,6 @@
     drawExistingZones();
     drawToolbar();
     drawZoneList();
-    renderCaptureSettingsPanel();
     renderRefImageControls();
     map.on('move zoom', updateRefImageOverlayPosition);
 
@@ -1977,7 +1996,7 @@
   function zoneInfoPopupHtml(z){
     var parts = [];
     if(z.notes) parts.push('<div style="margin-top:4px;font-size:12px;">'+escapeHtml(z.notes)+'</div>');
-    if(z.photo) parts.push('<img src="'+z.photo+'" style="max-width:200px;border-radius:4px;margin-top:6px;display:block;" />');
+    if(z.photo) parts.push('<img src="'+z.photo+'" style="width:140px;max-width:140px;height:auto;border-radius:4px;margin-top:6px;display:block;" />');
     return parts.join("");
   }
 
@@ -1986,9 +2005,13 @@
     if(z.kind === "point"){
       layer = L.marker(z.latlng, { icon: pointDivIcon(z) }).addTo(map).bindTooltip(escapeHtml(z.name));
       layer.on('click', function(){
-        var label = distanceLabel(z.latlng[0], z.latlng[1]);
-        if(label || z.notes || z.photo){
-          layer.bindPopup(escapeHtml(z.name) + (label ? (' — ' + label) : '') + zoneInfoPopupHtml(z)).openPopup();
+        // On relit les données à jour ici (pas la variable "z" figée à la création du
+        // calque) : sinon, des notes/une photo ajoutées après coup ne s'afficheraient
+        // jamais pour un joueur dont le calque existait déjà avant cet ajout.
+        var current = (state.cachedZones||[]).find(function(zz){ return zz.id === z.id; }) || z;
+        var label = distanceLabel(current.latlng[0], current.latlng[1]);
+        if(label || current.notes || current.photo){
+          layer.bindPopup(escapeHtml(current.name) + (label ? (' — ' + label) : '') + zoneInfoPopupHtml(current), { maxWidth: 170 }).openPopup();
         }
       });
     } else if(z.kind === "terrain"){
@@ -2023,11 +2046,15 @@
         color: info.color, weight:2, fillColor: info.color, fillOpacity:0.28,
         className: z.status === 'objectif' ? 'zone-objectif' : ''
       }).addTo(map).bindTooltip(escapeHtml(z.name) + ' · ' + info.label);
-      if(z.notes || z.photo){
-        layer.on('click', function(){
-          layer.bindPopup(escapeHtml(z.name) + zoneInfoPopupHtml(z)).openPopup();
-        });
-      }
+      // Toujours attaché (pas seulement si notes/photo existaient à la création du calque) :
+      // sinon un bâtiment sans notes au départ ne pourrait plus jamais en afficher, même
+      // après que l'organisateur en ait ajouté depuis l'éditeur.
+      layer.on('click', function(){
+        var current = (state.cachedZones||[]).find(function(zz){ return zz.id === z.id; }) || z;
+        if(current.notes || current.photo){
+          layer.bindPopup(escapeHtml(current.name) + zoneInfoPopupHtml(current), { maxWidth: 170 }).openPopup();
+        }
+      });
     }
     return layer;
   }
@@ -2269,11 +2296,11 @@
   function renderCaptureSettingsPanel(){
     var el = document.getElementById("capture-settings-panel");
     if(!el) return;
-    if(state.editorMode !== "live" || !state.event){ el.innerHTML = ""; return; }
+    if(!state.event){ el.innerHTML = ""; return; }
     var cfg = state.event;
     el.innerHTML =
-      '<div class="panel" style="margin-top:14px;">' +
-        '<label class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">🚩 Réglages capture &amp; score</label>' +
+      '<div style="border-top:1px solid var(--line); padding-top:10px; margin-top:4px;">' +
+        '<label class="mono" style="font-size:10px;color:var(--ink-dim);text-transform:uppercase;">Réglages capture &amp; score</label>' +
         '<div class="field" style="margin-top:6px;"><label>Temps de capture de base, seul (minutes)</label>' +
           '<input type="number" id="cap-base-minutes" value="'+(cfg.captureBaseMinutes||10)+'" min="1" /></div>' +
         '<div class="field"><label>Points par joueur, toutes les X secondes</label>' +
@@ -2606,10 +2633,10 @@
   // l'équipe une fois enregistrée (pas seulement sur le téléphone de qui l'a ajoutée).
   function renderZoneInfoPanel(z){
     return '<div class="panel" data-zone-info="'+z.id+'" style="margin-top:-4px;margin-bottom:6px;">' +
-      (z.photo ? ('<img src="'+z.photo+'" style="max-width:100%;border-radius:6px;margin-bottom:6px;display:block;" />') : '') +
+      (z.photo ? ('<img src="'+z.photo+'" style="width:140px;max-width:140px;height:auto;border-radius:6px;margin-bottom:6px;display:block;" />') : '') +
       '<div class="field" style="margin-top:0;"><label>Notes (détails, accès, etc.)</label>' +
         '<textarea class="zone-info-notes" data-id="'+z.id+'" rows="3" placeholder="Ex. 2 fenêtres, 1 porte, accès par le nord">'+escapeHtml(z.notes||"")+'</textarea></div>' +
-      '<input type="file" accept="image/*" capture="environment" class="zone-info-photo-input" data-id="'+z.id+'" style="display:none;" />' +
+      '<input type="file" accept="image/*" class="zone-info-photo-input" data-id="'+z.id+'" style="display:none;" />' +
       '<div class="row" style="margin-top:6px;">' +
         '<button class="btn btn-sm btn-ghost zone-info-photo-btn" data-id="'+z.id+'">📷 '+(z.photo?'Changer la photo':'Ajouter une photo')+'</button>' +
         (z.photo ? '<button class="btn btn-sm btn-ghost zone-info-photo-remove" data-id="'+z.id+'">Retirer la photo</button>' : '') +
@@ -3796,6 +3823,7 @@
       '<div class="panel"><div class="zone-row"><span class="name">🚩 Capture de drapeau</span></div>' +
         '<p style="font-size:12px;color:var(--ink-dim);">'+(flagCount ? (flagCount+' drapeau(x) sur la carte') : 'Aucun drapeau pour l\u2019instant.')+'</p>' +
         '<button class="btn btn-sm btn-ghost" id="btn-gm-flags">Gérer dans l\u2019éditeur</button>' +
+        '<div id="capture-settings-panel" style="margin-top:8px;"></div>' +
       '</div>' +
       '<div class="panel" style="margin-top:10px;"><div class="zone-row"><span class="name">☢️ Warzone</span></div>' +
         '<p style="font-size:12px;color:var(--ink-dim);">'+(warzoneCount ? (warzoneCount+' Warzone(s) sur la carte') : 'Aucune Warzone pour l\u2019instant.')+'</p>' +
@@ -3852,6 +3880,7 @@
     }
     renderScenarioPanel(zones);
     renderTimersPanel(timers);
+    renderCaptureSettingsPanel();
   }
 
   // ---------- Panneau de configuration du Scénario personnalisé (organisateur) ----------
@@ -4234,7 +4263,7 @@
         panel.classList.add("active");
         btn.classList.add("active");
         setTimeout(function(){
-          state.loupeLive = createLoupe(state.map, "loupe-panel-live");
+          state.loupeLive = createLoupe(state.map, "loupe-panel-live", function(){ return state.cachedZones; });
         }, 50); // laisse le panneau devenir visible avant d'y créer la carte Leaflet
       }
     };
