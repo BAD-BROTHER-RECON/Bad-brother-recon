@@ -162,6 +162,27 @@
     background:rgba(28,33,22,0.88); border:1px solid var(--line); color:var(--ink); font-size:17px; padding:0;
   }
   .map-rotate-wrapper.fullscreen .map-fullscreen-btn{ top:calc(env(safe-area-inset-top, 0px) + 10px); }
+  .map-recenter-btn, .map-follow-btn, .map-loupe-btn{
+    position:absolute; right:8px; z-index:410;
+    width:38px; height:38px; border-radius:50%; display:flex; align-items:center; justify-content:center;
+    background:rgba(28,33,22,0.88); border:1px solid var(--line); color:var(--ink); font-size:16px; padding:0;
+  }
+  .map-recenter-btn{ top:54px; }
+  .map-follow-btn{ top:100px; }
+  .map-follow-btn.active{ background:var(--amber); border-color:var(--amber); color:#191a10; }
+  .map-loupe-btn{ top:146px; }
+  .map-loupe-btn.active{ background:var(--amber); border-color:var(--amber); color:#191a10; }
+  .map-rotate-wrapper.fullscreen .map-recenter-btn{ top:calc(env(safe-area-inset-top, 0px) + 56px); }
+  .map-rotate-wrapper.fullscreen .map-follow-btn{ top:calc(env(safe-area-inset-top, 0px) + 102px); }
+  .map-rotate-wrapper.fullscreen .map-loupe-btn{ top:calc(env(safe-area-inset-top, 0px) + 148px); }
+  .loupe-panel{
+    position:absolute; left:10px; bottom:10px; z-index:415;
+    width:130px; height:130px; border-radius:50%; overflow:hidden;
+    border:3px solid rgba(231,221,201,.85); box-shadow:0 3px 10px rgba(0,0,0,.6);
+    pointer-events:none; display:none;
+  }
+  .loupe-panel.active{ display:block; }
+  .loupe-panel .leaflet-control-container{ display:none; }
   .warzone-banner-overlay{
     position:absolute; top:8px; left:8px; right:54px; z-index:405;
     display:flex; flex-direction:column; gap:3px; pointer-events:auto;
@@ -399,6 +420,16 @@
     squadOnly: false,
     compassAngle: 0,
     mapFullscreen: false,
+    followMe: false,
+    loupeLive: null,
+    loupeEditor: null,
+    cachedTimers: [],
+    notifPollTimer: null,
+    lastSeenLogTs: 0,
+    lastSeenChatTs: 0,
+    notifUnreadLog: 0,
+    notifUnreadChat: 0,
+    notifRecent: [],
     rosterSearch: "",
     isOrganizer: false,
     lastCoords: null,   // {lat,lng}
@@ -426,6 +457,7 @@
     drawLayer: null,
     editorWatchId: null,
     editingZoneId: null,   // zone en cours de modification (poignées visibles) dans l'éditeur
+    editingInfoZoneId: null,   // zone dont la fiche détail (notes/photo) est ouverte
     editorMeMarker: null,
     refImageDataUrl: null,
     refImageBounds: null,
@@ -566,6 +598,31 @@
     return new CachedLayer(url, opts);
   }
 
+  // ---------- Loupe (aide à la précision, carte en direct ET éditeur) ----------
+  // Petite carte secondaire zoomée davantage, qui suit le centre de la carte principale —
+  // pratique quand plusieurs marqueurs/points sont proches, ou pour tracer précisément.
+  function createLoupe(mainMap, panelId){
+    var panel = document.getElementById(panelId);
+    if(!panel || !mainMap) return null;
+    panel.innerHTML = '<div style="width:100%;height:100%;" id="'+panelId+'-inner"></div>';
+    var loupeMap = L.map(panelId+'-inner', {
+      zoomControl:false, attributionControl:false, dragging:false, scrollWheelZoom:false,
+      doubleClickZoom:false, touchZoom:false, boxZoom:false, keyboard:false, tap:false
+    }).setView(mainMap.getCenter(), Math.min(19, mainMap.getZoom()+3));
+    createCachedTileLayer().addTo(loupeMap);
+    var sync = function(){
+      loupeMap.setView(mainMap.getCenter(), Math.min(19, mainMap.getZoom()+3));
+    };
+    mainMap.on('move zoom', sync);
+    return {
+      destroy: function(){
+        mainMap.off('move zoom', sync);
+        loupeMap.remove();
+        panel.innerHTML = "";
+      }
+    };
+  }
+
   async function storageGet(key){
     if(!dbConfigured()) return null;
     try{
@@ -672,6 +729,15 @@
 
   // ---------- Chat (équipe, ou vers une autre équipe / le staff) ----------
   function eventChatKey(code){ return "event:" + code + ":chat"; }
+  function eventTimersKey(code){ return "event:" + code + ":timers"; }
+  async function loadTimers(code){
+    var raw = await storageGet(eventTimersKey(code));
+    if(!raw) return [];
+    try{ return JSON.parse(raw); }catch(e){ return []; }
+  }
+  async function saveTimers(code, timers){
+    return storageSet(eventTimersKey(code), JSON.stringify(timers));
+  }
   async function loadChat(code){
     var raw = await storageGet(eventChatKey(code));
     if(!raw) return [];
@@ -920,6 +986,7 @@
     stopMapIfNeeded();
     stopChatIfNeeded();
     stopVoiceIfNeeded();
+    stopNotifIfNeeded();
     // Synchronise l'écran courant avec l'historique du navigateur : sans ça, le bouton
     // "retour" du téléphone ne voit qu'une seule page du début à la fin de l'appli, et
     // saute direct au tout début (ou ferme l'appli) au lieu de revenir écran par écran.
@@ -964,6 +1031,9 @@
   function stopChatIfNeeded(){
     if(state.screen !== "chat" && state.chatPollTimer){ clearInterval(state.chatPollTimer); state.chatPollTimer = null; }
   }
+  function stopNotifIfNeeded(){
+    if(state.screen !== "map" && state.notifPollTimer){ clearInterval(state.notifPollTimer); state.notifPollTimer = null; }
+  }
   // Coupe le micro si on quitte le chat par un autre chemin que le bouton "Retour" (ex. le
   // bouton retour physique du téléphone) — sinon l'enregistrement continuerait en silence.
   function stopVoiceIfNeeded(){
@@ -975,6 +1045,66 @@
       if(state.voiceStream){ state.voiceStream.getTracks().forEach(function(t){ t.stop(); }); state.voiceStream = null; }
       state.voicePreviewDataUrl = null;
     }
+  }
+
+  // ---------- Centre de notifications (lié au Journal et au Chat) ----------
+  // Sondage volontairement plus lent (15s) que le cycle principal de la carte : le Journal
+  // et le Chat sont chacun un gros bloc à retélécharger entièrement, pas la peine de le
+  // faire aussi souvent que les positions des joueurs.
+  function startNotifPoll(){
+    stopNotifPoll();
+    refreshNotifCount();
+    state.notifPollTimer = setInterval(refreshNotifCount, 15000);
+  }
+  function stopNotifPoll(){
+    if(state.notifPollTimer){ clearInterval(state.notifPollTimer); state.notifPollTimer = null; }
+  }
+  async function refreshNotifCount(){
+    if(!state.event) return;
+    var log = await loadEventLog(state.event.code);
+    var chat = await loadChat(state.event.code);
+    var amPrivileged = state.isOrganizer || state.player.role === "staff";
+    var myTeam = state.player.team;
+    var lastLog = state.lastSeenLogTs || 0;
+    var lastChat = state.lastSeenChatTs || 0;
+    var unreadLogItems = log.filter(function(e){
+      return e.ts > lastLog && (amPrivileged || !e.team || e.team === myTeam);
+    });
+    var unreadChatItems = chat.filter(function(m){
+      return m.ts > lastChat && (m.to === "global" || m.to === myTeam);
+    });
+    state.notifUnreadLog = unreadLogItems.length;
+    state.notifUnreadChat = unreadChatItems.length;
+    state.notifRecent = unreadLogItems.concat(unreadChatItems).sort(function(a,b){ return b.ts - a.ts; }).slice(0, 5);
+    updateNotifBell();
+  }
+  function updateNotifBell(){
+    var badge = document.getElementById("notif-badge");
+    if(!badge) return;
+    var total = (state.notifUnreadLog||0) + (state.notifUnreadChat||0);
+    if(total > 0){ badge.style.display = "block"; badge.textContent = total > 99 ? "99+" : String(total); }
+    else{ badge.style.display = "none"; }
+  }
+  function renderNotifDropdown(){
+    var el = document.getElementById("notif-dropdown");
+    if(!el) return;
+    var recent = state.notifRecent || [];
+    el.innerHTML =
+      '<div class="panel" style="margin-top:6px;">' +
+        (recent.length ? recent.map(function(item){
+          var isChat = item.hasOwnProperty("from");
+          var d = new Date(item.ts);
+          var hh = ("0"+d.getHours()).slice(-2), mm = ("0"+d.getMinutes()).slice(-2);
+          var label = isChat ? ('💬 '+escapeHtml(item.from||"?")+' : '+(item.text ? escapeHtml(item.text) : "[vocal]")) : logEntryLabel(item);
+          return '<p style="font-size:12px;margin-top:4px;">'+label+' <span class="mono" style="font-size:10px;color:var(--ink-dim);">'+hh+':'+mm+'</span></p>';
+        }).join("") : '<p style="font-size:12px;color:var(--ink-dim);">Rien de nouveau.</p>') +
+        '<div class="row" style="margin-top:8px;">' +
+          '<button class="btn btn-sm btn-ghost" id="btn-notif-goto-log">📋 Journal'+((state.notifUnreadLog||0)>0?(' ('+state.notifUnreadLog+')'):'')+'</button>' +
+          '<button class="btn btn-sm btn-ghost" id="btn-notif-goto-chat">💬 Chat'+((state.notifUnreadChat||0)>0?(' ('+state.notifUnreadChat+')'):'')+'</button>' +
+        '</div>' +
+      '</div>';
+    document.getElementById("btn-notif-goto-log").onclick = function(){ teardownMap(); state.screen = "log"; render(); };
+    document.getElementById("btn-notif-goto-chat").onclick = function(){ teardownMap(); state.screen = "chat"; render(); };
   }
 
   // ---------- Écran d'introduction cinématique (Bad Brothers) ----------
@@ -1423,6 +1553,10 @@
       state.player._wasInSpawn = false;
       state.orgAccessUnlocked = false;
       state.chatChannel = null;
+      state.lastSeenLogTs = 0;
+      state.lastSeenChatTs = 0;
+      state.notifUnreadLog = 0;
+      state.notifUnreadChat = 0;
       state.screen = "map";
       render();
     }
@@ -1507,7 +1641,7 @@
     var center = state.editorCenter;
     app.innerHTML =
       '<div class="topbar"><button class="back">‹ Retour</button><div class="eyebrow">Bâtiments</div></div>' +
-      '<div id="editor-map"></div>' +
+      '<div style="position:relative;"><div id="editor-map"></div><button class="map-loupe-btn" id="btn-loupe-editor" title="Loupe" style="top:8px;">🔍</button><div class="loupe-panel" id="loupe-panel-editor"></div></div>' +
       '<div class="panel" style="margin-top:8px;">' +
         '<label class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">🖼️ Image de référence (aide au tracé)</label>' +
         '<p style="margin-top:4px;">Superpose un plan existant (PDF exporté en image, photo drone, plan à main levée…) sur la carte pour tracer par-dessus plus précisément. Reste sur ton téléphone, pas envoyée aux autres joueurs.</p>' +
@@ -1542,6 +1676,23 @@
     state.editorLayers = {};
     startEditorGeoWatch();
     setTimeout(function(){ if(state.editorMap) state.editorMap.invalidateSize(); }, 100);
+
+    document.getElementById("btn-loupe-editor").onclick = function(){
+      var btn = document.getElementById("btn-loupe-editor");
+      var panel = document.getElementById("loupe-panel-editor");
+      if(state.loupeEditor){
+        state.loupeEditor.destroy();
+        state.loupeEditor = null;
+        panel.classList.remove("active");
+        btn.classList.remove("active");
+      } else {
+        panel.classList.add("active");
+        btn.classList.add("active");
+        setTimeout(function(){
+          state.loupeEditor = createLoupe(state.editorMap, "loupe-panel-editor");
+        }, 50);
+      }
+    };
 
     drawExistingZones();
     drawToolbar();
@@ -1822,13 +1973,23 @@
     return { radius: radius, nextGrowMs: nextGrowMs, phase: phasesElapsed };
   }
 
+  // Affiche les notes/photo d'un bâtiment ou point-objectif dans son popup, si renseignées.
+  function zoneInfoPopupHtml(z){
+    var parts = [];
+    if(z.notes) parts.push('<div style="margin-top:4px;font-size:12px;">'+escapeHtml(z.notes)+'</div>');
+    if(z.photo) parts.push('<img src="'+z.photo+'" style="max-width:200px;border-radius:4px;margin-top:6px;display:block;" />');
+    return parts.join("");
+  }
+
   function addZoneLayer(map, z){
     var layer;
     if(z.kind === "point"){
       layer = L.marker(z.latlng, { icon: pointDivIcon(z) }).addTo(map).bindTooltip(escapeHtml(z.name));
       layer.on('click', function(){
         var label = distanceLabel(z.latlng[0], z.latlng[1]);
-        if(label) layer.bindPopup(escapeHtml(z.name) + ' — ' + label).openPopup();
+        if(label || z.notes || z.photo){
+          layer.bindPopup(escapeHtml(z.name) + (label ? (' — ' + label) : '') + zoneInfoPopupHtml(z)).openPopup();
+        }
       });
     } else if(z.kind === "terrain"){
       layer = L.polygon(z.points, { color:'#c9a227', weight:2, dashArray:'6,6', fillOpacity:0.04 })
@@ -1862,6 +2023,11 @@
         color: info.color, weight:2, fillColor: info.color, fillOpacity:0.28,
         className: z.status === 'objectif' ? 'zone-objectif' : ''
       }).addTo(map).bindTooltip(escapeHtml(z.name) + ' · ' + info.label);
+      if(z.notes || z.photo){
+        layer.on('click', function(){
+          layer.bindPopup(escapeHtml(z.name) + zoneInfoPopupHtml(z)).openPopup();
+        });
+      }
     }
     return layer;
   }
@@ -2370,9 +2536,10 @@
       return '<div class="zone-row">' +
         '<span style="font-size:15px;">'+ic.emoji+'</span>' +
         '<span class="name">'+escapeHtml(z.name)+'</span>' +
+        '<button class="btn btn-sm btn-ghost zone-info-toggle" data-id="'+z.id+'" title="Détails">ℹ️</button>' +
         '<button class="btn btn-sm btn-ghost point-edit" data-id="'+z.id+'" style="padding:6px 10px;">Modifier</button>' +
         '<button class="remove-chip zone-del" data-id="'+z.id+'">✕</button>' +
-      '</div>';
+      '</div>' + (state.editingInfoZoneId === z.id ? renderZoneInfoPanel(z) : '');
     }
     if(z.kind === "terrain"){
       return '<div class="zone-row">' +
@@ -2429,8 +2596,52 @@
       '<select class="zone-status" data-id="'+z.id+'">' +
         ZONE_STATUSES.map(function(s){ return '<option value="'+s.key+'"'+(s.key===z.status?' selected':'')+'>'+s.label+'</option>'; }).join("") +
       '</select>' +
+      '<button class="btn btn-sm btn-ghost zone-info-toggle" data-id="'+z.id+'" title="Détails">ℹ️</button>' +
       '<button class="remove-chip zone-del" data-id="'+z.id+'">✕</button>' +
+    '</div>' + (state.editingInfoZoneId === z.id ? renderZoneInfoPanel(z) : '');
+  }
+
+  // Fiche détail (notes libres + photo) pour un bâtiment ou un point-objectif — reste
+  // synchronisée via la même sauvegarde que les autres zones, donc visible par toute
+  // l'équipe une fois enregistrée (pas seulement sur le téléphone de qui l'a ajoutée).
+  function renderZoneInfoPanel(z){
+    return '<div class="panel" data-zone-info="'+z.id+'" style="margin-top:-4px;margin-bottom:6px;">' +
+      (z.photo ? ('<img src="'+z.photo+'" style="max-width:100%;border-radius:6px;margin-bottom:6px;display:block;" />') : '') +
+      '<div class="field" style="margin-top:0;"><label>Notes (détails, accès, etc.)</label>' +
+        '<textarea class="zone-info-notes" data-id="'+z.id+'" rows="3" placeholder="Ex. 2 fenêtres, 1 porte, accès par le nord">'+escapeHtml(z.notes||"")+'</textarea></div>' +
+      '<input type="file" accept="image/*" capture="environment" class="zone-info-photo-input" data-id="'+z.id+'" style="display:none;" />' +
+      '<div class="row" style="margin-top:6px;">' +
+        '<button class="btn btn-sm btn-ghost zone-info-photo-btn" data-id="'+z.id+'">📷 '+(z.photo?'Changer la photo':'Ajouter une photo')+'</button>' +
+        (z.photo ? '<button class="btn btn-sm btn-ghost zone-info-photo-remove" data-id="'+z.id+'">Retirer la photo</button>' : '') +
+      '</div>' +
+      '<div class="row" style="margin-top:8px;">' +
+        '<button class="btn btn-sm btn-primary zone-info-save" data-id="'+z.id+'">Enregistrer</button>' +
+        '<button class="btn btn-sm btn-ghost zone-info-close" data-id="'+z.id+'">Fermer</button>' +
+      '</div>' +
     '</div>';
+  }
+
+  // Redimensionne/compresse la photo côté téléphone avant de l'attacher — une photo brute
+  // de smartphone peut peser plusieurs Mo, bien trop pour un bloc Firebase partagé par tous.
+  function resizeAndAttachPhoto(zoneId, file){
+    var reader = new FileReader();
+    reader.onload = function(ev){
+      var img = new Image();
+      img.onload = function(){
+        var maxDim = 800;
+        var scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+        var canvas = document.createElement("canvas");
+        canvas.width = Math.round(img.width * scale);
+        canvas.height = Math.round(img.height * scale);
+        var ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        var dataUrl = canvas.toDataURL("image/jpeg", 0.7);
+        var z = state.editorZones.find(function(zz){ return zz.id === zoneId; });
+        if(z){ z.photo = dataUrl; drawZoneList(); }
+      };
+      img.src = ev.target.result;
+    };
+    reader.readAsDataURL(file);
   }
 
   var ZONE_GROUP_DEFS = [
@@ -2478,6 +2689,44 @@
       btn.onclick = function(){
         var z = state.editorZones.find(function(z){ return z.id === btn.dataset.id; });
         if(z) openPointForm(z.latlng, z);
+      };
+    });
+    Array.prototype.forEach.call(wrap.querySelectorAll(".zone-info-toggle"), function(btn){
+      btn.onclick = function(){
+        state.editingInfoZoneId = (state.editingInfoZoneId === btn.dataset.id) ? null : btn.dataset.id;
+        drawZoneList();
+      };
+    });
+    Array.prototype.forEach.call(wrap.querySelectorAll(".zone-info-close"), function(btn){
+      btn.onclick = function(){ state.editingInfoZoneId = null; drawZoneList(); };
+    });
+    Array.prototype.forEach.call(wrap.querySelectorAll(".zone-info-photo-btn"), function(btn){
+      btn.onclick = function(){
+        var input = wrap.querySelector('.zone-info-photo-input[data-id="'+btn.dataset.id+'"]') ||
+          document.querySelector('.zone-info-photo-input[data-id="'+btn.dataset.id+'"]');
+        if(input) input.click();
+      };
+    });
+    Array.prototype.forEach.call(wrap.querySelectorAll(".zone-info-photo-input"), function(input){
+      input.onchange = function(e){
+        var file = e.target.files && e.target.files[0];
+        if(file) resizeAndAttachPhoto(input.dataset.id, file);
+      };
+    });
+    Array.prototype.forEach.call(wrap.querySelectorAll(".zone-info-photo-remove"), function(btn){
+      btn.onclick = function(){
+        var z = state.editorZones.find(function(z){ return z.id === btn.dataset.id; });
+        if(z){ z.photo = null; drawZoneList(); }
+      };
+    });
+    Array.prototype.forEach.call(wrap.querySelectorAll(".zone-info-save"), function(btn){
+      btn.onclick = async function(){
+        var z = state.editorZones.find(function(z){ return z.id === btn.dataset.id; });
+        var textarea = wrap.querySelector('.zone-info-notes[data-id="'+btn.dataset.id+'"]');
+        if(z && textarea){ z.notes = textarea.value; }
+        state.editingInfoZoneId = null;
+        drawZoneList();
+        await persistEditorZones();
       };
     });
     Array.prototype.forEach.call(wrap.querySelectorAll(".zone-status"), function(sel){
@@ -2599,7 +2848,9 @@
   function teardownEditorMap(){
     state.drawing = false; state.drawPoints = []; state.drawLayer = null; state.drawKind = null; state.placingPoint = false;
     state.editingZoneId = null;
+    state.editingInfoZoneId = null;
     stopEditorGeoWatch();
+    if(state.loupeEditor){ state.loupeEditor.destroy(); state.loupeEditor = null; }
     if(state.editorMap){ state.editorMap.remove(); state.editorMap = null; }
     state.editorLayers = {};
     state.segmentLabelLayers = [];
@@ -3233,6 +3484,9 @@
   function renderChat(){
     if(!state.event) return;
     if(!state.chatChannel) state.chatChannel = "team";
+    state.lastSeenChatTs = Date.now();
+    state.notifUnreadChat = 0;
+    updateNotifBell();
     app.innerHTML =
       '<div class="topbar"><button class="back">‹ Retour</button><div class="eyebrow">💬 Chat</div></div>' +
       '<div class="row" style="margin-top:6px;flex-wrap:wrap;">' +
@@ -3420,6 +3674,9 @@
 
   function renderLog(){
     var amPrivileged = state.isOrganizer || state.player.role === "staff";
+    state.lastSeenLogTs = Date.now();
+    state.notifUnreadLog = 0;
+    updateNotifBell();
     app.innerHTML =
       '<div class="topbar"><button class="back">‹ Retour</button><div class="eyebrow">'+(amPrivileged ? "Journal général" : "Journal")+'</div></div>' +
       (amPrivileged ? '<p style="margin-top:4px;">Tout ce qui se passe sur le terrain, toutes équipes confondues.</p>'
@@ -3429,19 +3686,20 @@
     loadLog();
   }
 
+  function logEntryLabel(e){
+    if(e.type === "sos") return "🆘 SOS déclenché par "+escapeHtml(e.name);
+    if(e.type === "sos_resolved") return "✓ SOS résolu par "+escapeHtml(e.name);
+    if(e.type === "flag_capture") return "🚩 "+escapeHtml(e.team||"?")+" capture "+escapeHtml(e.name);
+    if(e.type === "ping") return "📍 "+escapeHtml(e.name)+" ("+escapeHtml(e.team||"?")+") : "+(e.detail||"");
+    if(e.type === "deathmatch_out") return "☠️ "+escapeHtml(e.name)+" éliminé"+(e.team?(" ("+escapeHtml(e.team)+")"):"");
+    if(e.type === "objective_complete") return "📂 Objectif atteint : "+escapeHtml(e.name);
+    if(e.type === "gas_triggered") return "☣️ Gaz déclenché (scénario terminé)";
+    return escapeHtml(e.type||"événement");
+  }
   function renderLogEntry(e){
     var d = new Date(e.ts);
     var hh = ("0"+d.getHours()).slice(-2), mm = ("0"+d.getMinutes()).slice(-2);
-    var label;
-    if(e.type === "sos") label = "🆘 SOS déclenché par "+escapeHtml(e.name);
-    else if(e.type === "sos_resolved") label = "✓ SOS résolu par "+escapeHtml(e.name);
-    else if(e.type === "flag_capture") label = "🚩 "+escapeHtml(e.team||"?")+" capture "+escapeHtml(e.name);
-    else if(e.type === "ping") label = "📍 "+escapeHtml(e.name)+" ("+escapeHtml(e.team||"?")+") : "+(e.detail||"");
-    else if(e.type === "deathmatch_out") label = "☠️ "+escapeHtml(e.name)+" éliminé"+(e.team?(" ("+escapeHtml(e.team)+")"):"");
-    else if(e.type === "objective_complete") label = "📂 Objectif atteint : "+escapeHtml(e.name);
-    else if(e.type === "gas_triggered") label = "☣️ Gaz déclenché (scénario terminé)";
-    else label = escapeHtml(e.type||"événement");
-    return '<div class="zone-row"><span class="name">'+label+'</span><span class="mono" style="font-size:10px;color:var(--ink-dim);">'+hh+':'+mm+'</span></div>';
+    return '<div class="zone-row"><span class="name">'+logEntryLabel(e)+'</span><span class="mono" style="font-size:10px;color:var(--ink-dim);">'+hh+':'+mm+'</span></div>';
   }
 
   async function loadLog(){
@@ -3474,6 +3732,41 @@
     loadGameModeSummary();
   }
 
+  // ---------- Timers indépendants du staff (comptes à rebours libres) ----------
+  function renderTimersPanel(timers){
+    var el = document.getElementById("timers-panel");
+    if(!el || !state.event) return;
+    var now = Date.now();
+    var rowsHtml = timers.length ? timers.map(function(t){
+      var remaining = Math.max(0, t.endsAt - now);
+      var mm = Math.floor(remaining/60000), ss = Math.floor((remaining%60000)/1000);
+      var label = remaining > 0 ? (mm+":"+("0"+ss).slice(-2)) : "Terminé";
+      return '<div class="zone-row"><span class="name">'+escapeHtml(t.name)+'</span>' +
+        '<span class="mono" style="font-size:13px;font-weight:700;">'+label+'</span>' +
+        '<button class="remove-chip timer-del" data-id="'+t.id+'">✕</button></div>';
+    }).join("") : '<p style="font-size:12px;color:var(--ink-dim);">Aucun timer actif.</p>';
+
+    el.innerHTML = rowsHtml +
+      '<div class="field" style="margin-top:8px;"><label>Nom du timer</label><input type="text" id="timer-new-name" placeholder="Ex. Extraction" /></div>' +
+      '<div class="field"><label>Durée (minutes)</label><input type="number" id="timer-new-minutes" value="10" min="1" /></div>' +
+      '<button class="btn btn-sm btn-primary" id="btn-timer-add">+ Ajouter un timer</button>';
+
+    Array.prototype.forEach.call(el.querySelectorAll(".timer-del"), function(btn){
+      btn.onclick = async function(){
+        var updated = timers.filter(function(t){ return t.id !== btn.dataset.id; });
+        await saveTimers(state.event.code, updated);
+        loadGameModeSummary();
+      };
+    });
+    document.getElementById("btn-timer-add").onclick = async function(){
+      var name = document.getElementById("timer-new-name").value.trim() || "Timer";
+      var minutes = Math.max(1, parseInt(document.getElementById("timer-new-minutes").value, 10) || 10);
+      timers.push({ id: genId("tmr"), name: name, endsAt: Date.now() + minutes*60000 });
+      await saveTimers(state.event.code, timers);
+      loadGameModeSummary();
+    };
+  }
+
   async function loadGameModeSummary(){
     var el = document.getElementById("gamemode-list");
     if(!el || !state.event) return;
@@ -3497,6 +3790,8 @@
          (spawnCount ? '' : '<p style="font-size:11px;color:var(--amber);">Aucune zone de spawn définie — vas-y dans l\u2019éditeur pour qu\u2019un retour au spawn retire une vie.</p>') +
          '<button class="btn btn-sm btn-primary" id="btn-dm-enable" style="margin-top:4px;">Activer</button>');
 
+    var timers = await loadTimers(code);
+
     el.innerHTML =
       '<div class="panel"><div class="zone-row"><span class="name">🚩 Capture de drapeau</span></div>' +
         '<p style="font-size:12px;color:var(--ink-dim);">'+(flagCount ? (flagCount+' drapeau(x) sur la carte') : 'Aucun drapeau pour l\u2019instant.')+'</p>' +
@@ -3515,6 +3810,10 @@
       '</div>' +
       '<div class="panel" style="margin-top:10px;"><div class="zone-row"><span class="name">📂 Scénario personnalisé</span></div>' +
         '<div id="scenario-panel"></div>' +
+      '</div>' +
+      '<div class="panel" style="margin-top:10px;"><div class="zone-row"><span class="name">⏱️ Timers</span></div>' +
+        '<p style="font-size:12px;color:var(--ink-dim);">Comptes à rebours libres, visibles de tous sur la carte (extraction, pause, renfort…).</p>' +
+        '<div id="timers-panel" style="margin-top:6px;"></div>' +
       '</div>';
 
     document.getElementById("btn-gm-flags").onclick = document.getElementById("btn-gm-warzone").onclick = async function(){
@@ -3552,6 +3851,7 @@
       };
     }
     renderScenarioPanel(zones);
+    renderTimersPanel(timers);
   }
 
   // ---------- Panneau de configuration du Scénario personnalisé (organisateur) ----------
@@ -3849,8 +4149,9 @@
   function renderMap(){
     var cfg = state.event;
     app.innerHTML =
-      '<div class="topbar"><button class="back">‹ Quitter</button><div class="eyebrow">'+escapeHtml(cfg.name)+' · '+cfg.code+'</div></div>' +
-      '<div class="map-rotate-wrapper" id="map-wrapper"><div id="map"></div><button class="map-fullscreen-btn" id="btn-fullscreen-map" title="Plein écran">⛶</button><div class="warzone-banner-overlay"><div id="scenario-banner"></div><div id="limits-banner"></div><div id="warzone-banner"></div><div id="gas-banner"></div><div id="fog-banner"></div><div id="radar-bonus-banner"></div><div id="flag-banner"></div><div id="scoreboard"></div><div id="lives-board"></div></div></div>' +
+      '<div class="topbar"><button class="back">‹ Quitter</button><div class="eyebrow">'+escapeHtml(cfg.name)+' · '+cfg.code+'</div><button class="btn btn-ghost btn-sm" id="btn-notif-bell" style="position:relative;">🔔<span id="notif-badge" style="display:none;position:absolute;top:-6px;right:-6px;background:var(--danger);color:#fff;border-radius:50%;min-width:16px;height:16px;font-size:10px;line-height:16px;text-align:center;padding:0 3px;"></span></button></div>' +
+      '<div id="notif-dropdown" style="display:none;"></div>' +
+      '<div class="map-rotate-wrapper" id="map-wrapper"><div id="map"></div><button class="map-fullscreen-btn" id="btn-fullscreen-map" title="Plein écran">⛶</button><button class="map-recenter-btn" id="btn-recenter-map" title="Recentrer sur moi">📍</button><button class="map-follow-btn" id="btn-follow-map" title="Suivre ma position">🧭</button><button class="map-loupe-btn" id="btn-loupe-map" title="Loupe">🔍</button><div class="loupe-panel" id="loupe-panel-live"></div><div class="warzone-banner-overlay"><div id="scenario-banner"></div><div id="limits-banner"></div><div id="timers-banner"></div><div id="warzone-banner"></div><div id="gas-banner"></div><div id="fog-banner"></div><div id="radar-bonus-banner"></div><div id="flag-banner"></div><div id="scoreboard"></div><div id="lives-board"></div></div></div>' +
       '<div class="status-bar"><span class="status-dot" id="status-dot"></span><span id="status-text">Initialisation…</span></div>' +
       '<p id="zone-danger-note" class="mono" style="font-size:11px;color:#f2a89a;margin-top:4px;"></p>' +
       '<p id="offline-indicator" class="mono" style="font-size:11px;color:var(--amber);margin-top:4px;display:none;"></p>' +
@@ -3912,6 +4213,37 @@
       // exactement comme le joueur (ou le staff) l'avait réglée avant de basculer.
       setTimeout(function(){ if(state.map) state.map.invalidateSize(); }, 60);
     };
+    document.getElementById("btn-recenter-map").onclick = function(){
+      if(state.lastCoords && state.map) state.map.setView([state.lastCoords.lat, state.lastCoords.lng], Math.max(state.map.getZoom(), 17), { animate:true });
+    };
+    document.getElementById("btn-follow-map").onclick = function(){
+      state.followMe = !state.followMe;
+      var btn = document.getElementById("btn-follow-map");
+      btn.classList.toggle("active", state.followMe);
+      if(state.followMe && state.lastCoords && state.map){ state.map.setView([state.lastCoords.lat, state.lastCoords.lng], Math.max(state.map.getZoom(), 17), { animate:true }); }
+    };
+    document.getElementById("btn-loupe-map").onclick = function(){
+      var btn = document.getElementById("btn-loupe-map");
+      var panel = document.getElementById("loupe-panel-live");
+      if(state.loupeLive){
+        state.loupeLive.destroy();
+        state.loupeLive = null;
+        panel.classList.remove("active");
+        btn.classList.remove("active");
+      } else {
+        panel.classList.add("active");
+        btn.classList.add("active");
+        setTimeout(function(){
+          state.loupeLive = createLoupe(state.map, "loupe-panel-live");
+        }, 50); // laisse le panneau devenir visible avant d'y créer la carte Leaflet
+      }
+    };
+    document.getElementById("btn-notif-bell").onclick = function(){
+      var el = document.getElementById("notif-dropdown");
+      if(el.style.display === "none"){ el.style.display = "block"; renderNotifDropdown(); }
+      else{ el.style.display = "none"; }
+    };
+    startNotifPoll();
     var squadToggle = document.getElementById("squad-only-toggle");
     if(squadToggle) squadToggle.onchange = function(e){ state.squadOnly = e.target.checked; refreshPlayers(); };
     document.getElementById("battery-saver-toggle").onchange = function(e){
@@ -3982,6 +4314,13 @@
     state.map = map;
     map.on('zoomend', applyLabelZoomVisibility);
     map.on('zoomend moveend', updateMarkerClusters);
+    map.on('dragstart', function(){
+      if(state.followMe){
+        state.followMe = false;
+        var followBtn = document.getElementById("btn-follow-map");
+        if(followBtn) followBtn.classList.remove("active");
+      }
+    });
     applyLabelZoomVisibility();
     applyCompassRotation();
     setupMapRotateGesture(document.getElementById("map"));
@@ -4065,7 +4404,7 @@
   // données déjà en cache — pas besoin d'interroger le réseau plus souvent pour ça.
   function startWarzoneTicker(){
     if(state.warzoneTickTimer) return;
-    state.warzoneTickTimer = setInterval(function(){ updateWarzoneBanner(state.cachedZones); updateGasBanner(state.cachedZones); updateFogBanner(); updateRadarBonusBanner(); updateFlagCaptureBanner(state.cachedZones); updateLimitsBanner(); }, 1000);
+    state.warzoneTickTimer = setInterval(function(){ updateWarzoneBanner(state.cachedZones); updateGasBanner(state.cachedZones); updateFogBanner(); updateRadarBonusBanner(); updateFlagCaptureBanner(state.cachedZones); updateLimitsBanner(); updateTimersBanner(); }, 1000);
   }
   function stopWarzoneTicker(){
     if(state.warzoneTickTimer){ clearInterval(state.warzoneTickTimer); state.warzoneTickTimer = null; }
@@ -4218,6 +4557,7 @@
     state.watchId = navigator.geolocation.watchPosition(function(pos){
       state.lastCoords = { lat: pos.coords.latitude, lng: pos.coords.longitude };
       setStatus(true, "Position active");
+      if(state.followMe && state.map){ state.map.panTo([state.lastCoords.lat, state.lastCoords.lng], { animate:true }); }
     }, function(err){
       setStatus(false, "Position indisponible");
       if(banner){
@@ -4679,6 +5019,24 @@
     updateScenarioBanner();
     if(state.networkOk){ state.cachedScore = await loadScore(state.event.code); }
     updateScoreboard();
+    if(state.networkOk){ state.cachedTimers = await loadTimers(state.event.code); }
+    updateTimersBanner();
+  }
+
+  function updateTimersBanner(){
+    var el = document.getElementById("timers-banner");
+    if(!el) return;
+    var now = Date.now();
+    var active = (state.cachedTimers||[]).filter(function(t){ return t.endsAt > now; });
+    if(!active.length){ el.innerHTML = ""; return; }
+    el.innerHTML = active.map(function(t){
+      var remaining = t.endsAt - now;
+      var mm = Math.floor(remaining/60000), ss = Math.floor((remaining%60000)/1000);
+      return '<div class="warzone-alert pending">' +
+        '<div class="wz-name">⏱️ '+escapeHtml(t.name)+'</div>' +
+        '<div class="wz-time">'+mm+':'+("0"+ss).slice(-2)+'</div>' +
+      '</div>';
+    }).join("");
   }
 
   // ---------- Repli hors-ligne : dernière image connue (joueurs, zones, visibilité) ----------
@@ -5131,6 +5489,8 @@
     stopWarzoneTicker();
     state.compassAngle = 0;
     state.mapFullscreen = false;
+    state.followMe = false;
+    if(state.loupeLive){ state.loupeLive.destroy(); state.loupeLive = null; }
     if(state.map){ state.map.remove(); state.map = null; }
     state.markers = {};
     state.zonesLayers = {};
