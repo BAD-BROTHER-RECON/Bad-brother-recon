@@ -419,6 +419,7 @@
     testMode: false,
     squadOnly: false,
     compassAngle: 0,
+    rotationLocked: false,
     mapFullscreen: false,
     followMe: false,
     loupeLive: null,
@@ -4266,11 +4267,13 @@
         '<div class="compass-dial" id="compass-dial"><div class="compass-dial-face" id="compass-dial-face"><span class="compass-dial-n">N</span></div></div>' +
         '<div><p class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;margin:0;">Rotation manuelle</p>' +
         '<p style="margin:2px 0 0;">Fais glisser le cadran pour orienter la carte.</p>' +
-        '<button class="btn btn-sm btn-ghost" id="btn-compass-reset" style="margin-top:6px;">↑ Nord en haut</button></div>' +
+        '<div class="row" style="margin-top:6px;flex-wrap:wrap;">' +
+          '<button class="btn btn-sm btn-ghost" id="btn-compass-reset">↑ Nord en haut</button>' +
+          '<button class="btn btn-sm '+(state.rotationLocked?'btn-primary':'btn-ghost')+'" id="btn-rotation-lock">'+(state.rotationLocked?'🔒 Rotation bloquée':'🔓 Bloquer la rotation')+'</button>' +
+        '</div></div>' +
       '</div>' +
       '<p id="compass-drag-hint" style="font-size:11px;color:var(--amber-dim);margin-top:4px;"></p>' +
-      '<div class="test-toggle"><span class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">Mode test (clic sur la carte = ta position)</span>' +
-        '<input type="checkbox" id="test-mode" '+(state.testMode?'checked':'')+' /></div>' +
+      '<div id="test-mode-section"></div>' +
       (state.player.squad ? '<div class="test-toggle"><span class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">Mon escouade seulement ('+escapeHtml(state.player.squad)+')</span>' +
         '<input type="checkbox" id="squad-only-toggle" '+(state.squadOnly?'checked':'')+' /></div>' : '') +
       '<div class="test-toggle"><span class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">🔋 Économie de batterie</span>' +
@@ -4294,11 +4297,17 @@
       '<div id="admin-actions" class="row" style="margin-top:10px;flex-wrap:wrap;"></div>';
 
     document.querySelector(".back").onclick = function(){ teardownMap(); forgetLastEvent(); state.screen="home"; render(); };
-    document.getElementById("test-mode").onchange = function(e){ state.testMode = e.target.checked; applyGeoMode(); };
     setupCompassDial();
     document.getElementById("btn-compass-reset").onclick = function(){
       state.compassAngle = 0;
       applyCompassRotation();
+    };
+    document.getElementById("btn-rotation-lock").onclick = function(){
+      state.rotationLocked = !state.rotationLocked;
+      var btn = document.getElementById("btn-rotation-lock");
+      btn.classList.toggle("btn-primary", state.rotationLocked);
+      btn.classList.toggle("btn-ghost", !state.rotationLocked);
+      btn.textContent = state.rotationLocked ? "🔒 Rotation bloquée" : "🔓 Bloquer la rotation";
     };
     document.getElementById("btn-fullscreen-map").onclick = function(){
       state.mapFullscreen = !state.mapFullscreen;
@@ -4593,6 +4602,7 @@
     }
 
     dial.addEventListener("pointerdown", function(e){
+      if(state.rotationLocked) return;
       dragging = true;
       try{ dial.setPointerCapture(e.pointerId); }catch(err){}
       recenterOnMeIfPossible();
@@ -4600,7 +4610,7 @@
       applyCompassRotation();
     });
     dial.addEventListener("pointermove", function(e){
-      if(!dragging) return;
+      if(!dragging || state.rotationLocked) return;
       state.compassAngle = angleFromPoint(e.clientX, e.clientY);
       applyCompassRotation();
     });
@@ -4627,6 +4637,7 @@
       }
     }, { passive:true });
     mapEl.addEventListener("touchmove", function(e){
+      if(state.rotationLocked) return;
       if(e.touches.length === 2 && startAngle !== null){
         var currentAngle = angleOf(e.touches[0], e.touches[1]);
         var delta = currentAngle - startAngle;
@@ -4811,8 +4822,7 @@
     el.dataset.bound = "1";
     el.innerHTML = '<div class="test-toggle"><span class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">Visible des autres joueurs (staff)</span>' +
       '<input type="checkbox" id="staff-visible-toggle" '+(state.player.staffHidden?'':'checked')+' /></div>' +
-      '<div class="row" style="margin-top:8px;flex-wrap:wrap;">' +
-        '<button class="btn btn-ghost btn-sm" id="btn-edit-buildings-staff">Éditer la carte</button>' +
+      '<div class="row" style="margin-top:8px;flex-wrap:wrap;">' +        '<button class="btn btn-ghost btn-sm" id="btn-edit-buildings-staff">Éditer la carte</button>' +
         '<button class="btn btn-ghost btn-sm" id="btn-code-staff">Code / QR</button>' +
         '<button class="btn btn-ghost btn-sm" id="btn-log-staff">📋 Journal</button>' +
         '<button class="btn btn-ghost btn-sm" id="btn-gamemode-staff">🕹 Mode de jeu</button>' +
@@ -4846,6 +4856,19 @@
       state.screen = "gamemode";
       render();
     };
+  }
+
+  // Mode test réservé au staff/organisateur : un joueur ordinaire ne doit pas pouvoir
+  // simuler sa position en touchant la carte, ça n'a de sens que pour tester/organiser.
+  function updateTestModeUI(amPrivileged){
+    var el = document.getElementById("test-mode-section");
+    if(!el) return;
+    if(!amPrivileged){ el.innerHTML = ""; el.dataset.bound = ""; state.testMode = false; return; }
+    if(el.dataset.bound === "1") return;
+    el.dataset.bound = "1";
+    el.innerHTML = '<div class="test-toggle"><span class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">Mode test (clic sur la carte = ta position)</span>' +
+      '<input type="checkbox" id="test-mode" '+(state.testMode?'checked':'')+' /></div>';
+    document.getElementById("test-mode").onchange = function(e){ state.testMode = e.target.checked; applyGeoMode(); };
   }
 
   // Filet de sécurité : si l'administrateur enregistré n'a plus donné signe de vie depuis
@@ -4901,6 +4924,7 @@
 
     updateAdminUI();
     updateStaffUI(amStaff);
+    updateTestModeUI(state.isOrganizer || amStaff);
 
     var adminEntry = vis.adminId ? players[vis.adminId] : null;
     var adminGone = !state.isOrganizer && (!vis.adminId || !adminEntry || (Date.now() - (adminEntry.ts||0)) > 600000);
@@ -5182,7 +5206,14 @@
     if(state.fogUntil && state.fogUntil > Date.now()){ renderPingMarkers([]); return; }
     var pings = await loadPings(state.event.code);
     var now = Date.now();
-    pings = pings.filter(function(p){ return (now - p.ts) < PING_DURATION_MS; });
+    // Comme le chat et le journal : un joueur ne voit que les pings de sa propre équipe,
+    // le staff/organisateur voit tout. Manquait ici jusqu'ici — un vrai trou, l'équipe
+    // adverse pouvait voir où l'autre équipe pose ses repères tactiques.
+    var amPrivileged = state.isOrganizer || state.player.role === "staff";
+    var myTeam = state.player.team;
+    pings = pings.filter(function(p){
+      return (now - p.ts) < PING_DURATION_MS && (amPrivileged || p.team === myTeam);
+    });
     state.cachedPings = pings;
     renderPingMarkers(pings);
   }
