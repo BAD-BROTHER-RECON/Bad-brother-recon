@@ -415,7 +415,7 @@
     playerId: getOrCreatePlayerId(),
     event: null,        // { code, name, teams:[{name,color}], center:{lat,lng}, zoom }
     joinCodeDraft: "",
-    player: { name: "", team: null, squad: "" },
+    player: { name: "", team: null, squad: "", photo: null },
     testMode: false,
     squadOnly: false,
     compassAngle: 0,
@@ -430,6 +430,7 @@
     notifUnreadLog: 0,
     notifUnreadChat: 0,
     notifRecent: [],
+    cachedPlayerPhotos: {},
     rosterSearch: "",
     isOrganizer: false,
     lastCoords: null,   // {lat,lng}
@@ -617,6 +618,7 @@
     }).setView(mainMap.getCenter(), Math.min(19, mainMap.getZoom()+3));
     createCachedTileLayer().addTo(loupeMap);
     var zoneLayers = [];
+    var meMarker = null;
     var redrawZones = function(){
       zoneLayers.forEach(function(l){ loupeMap.removeLayer(l); });
       zoneLayers = [];
@@ -626,17 +628,32 @@
         try{ zoneLayers.push(addZoneLayer(loupeMap, z)); }catch(e){ /* une zone corrompue ne doit pas bloquer les autres */ }
       });
     };
+    var updateMePosition = function(){
+      if(!state.lastCoords){
+        if(meMarker){ loupeMap.removeLayer(meMarker); meMarker = null; }
+        return;
+      }
+      var ll = [state.lastCoords.lat, state.lastCoords.lng];
+      if(!meMarker){
+        meMarker = L.circleMarker(ll, { radius:7, color:'#e7ddc9', weight:2, fillColor:'#3b82c4', fillOpacity:1 }).addTo(loupeMap);
+      } else {
+        meMarker.setLatLng(ll);
+      }
+    };
     var sync = function(){
       // { animate:false } : un recentrage instantané, sans easing — l'ancienne version
       // laissait la loupe "flotter" en retard sur la carte principale, ce qui donnait
       // l'impression d'un comportement aléatoire.
       loupeMap.setView(mainMap.getCenter(), Math.min(19, mainMap.getZoom()+3), { animate:false });
       redrawZones();
+      updateMePosition();
     };
     mainMap.on('move zoom', sync);
     sync();
+    var meTimer = setInterval(updateMePosition, 2000);
     return {
       destroy: function(){
+        clearInterval(meTimer);
         mainMap.off('move zoom', sync);
         loupeMap.remove();
         panel.innerHTML = "";
@@ -750,6 +767,21 @@
 
   // ---------- Chat (équipe, ou vers une autre équipe / le staff) ----------
   function eventChatKey(code){ return "event:" + code + ":chat"; }
+  // ---------- Photo d'identité des joueurs ----------
+  // Stockée à part de la fiche joueur (qui elle est réécrite à chaque battement de
+  // position) : une photo ne doit jamais être renvoyée en boucle toutes les quelques
+  // secondes, seulement au moment où elle est ajoutée ou changée.
+  function eventPlayerPhotosKey(code){ return "event:" + code + ":playerPhotos"; }
+  async function loadPlayerPhotos(code){
+    var raw = await storageGet(eventPlayerPhotosKey(code));
+    if(!raw) return {};
+    try{ return JSON.parse(raw); }catch(e){ return {}; }
+  }
+  async function savePlayerPhoto(code, playerId, dataUrl){
+    var photos = await loadPlayerPhotos(code);
+    if(dataUrl){ photos[playerId] = dataUrl; } else { delete photos[playerId]; }
+    return storageSet(eventPlayerPhotosKey(code), JSON.stringify(photos));
+  }
   function eventTimersKey(code){ return "event:" + code + ":timers"; }
   async function loadTimers(code){
     var raw = await storageGet(eventTimersKey(code));
@@ -1098,6 +1130,10 @@
     state.notifUnreadChat = unreadChatItems.length;
     state.notifRecent = unreadLogItems.concat(unreadChatItems).sort(function(a,b){ return b.ts - a.ts; }).slice(0, 5);
     updateNotifBell();
+    // Les photos de joueurs changent rarement (ajoutées à l'inscription) : ce rythme plus
+    // lent suffit largement, pas besoin de les recharger à chaque battement de position.
+    state.cachedPlayerPhotos = await loadPlayerPhotos(state.event.code);
+    if(state.cachedAllPlayers) updateRoster(state.cachedAllPlayers);
   }
   function updateNotifBell(){
     var badge = document.getElementById("notif-badge");
@@ -1530,6 +1566,16 @@
           '<input type="text" id="p-squad" placeholder="Ex. Escouade 1" value="'+escapeHtml(state.player.squad||"")+'" />' +
           '<p style="margin-top:4px;">Pour pouvoir filtrer la carte sur ton petit groupe plutôt que toute l\u2019équipe.</p>' +
         '</div>' +
+        '<div class="field"><label>Photo (optionnel — comme une pièce d\u2019identité pour tes coéquipiers)</label>' +
+          (state.player.photo ? ('<img src="'+state.player.photo+'" style="width:84px;height:84px;object-fit:cover;border-radius:50%;display:block;margin-bottom:8px;" />') : '') +
+          '<input type="file" accept="image/*" capture="user" id="p-photo-camera" style="display:none;" />' +
+          '<input type="file" accept="image/*" id="p-photo-gallery" style="display:none;" />' +
+          '<div class="row" style="flex-wrap:wrap;">' +
+            '<button class="btn btn-sm btn-ghost" id="btn-p-photo-camera" type="button">🤳 Selfie</button>' +
+            '<button class="btn btn-sm btn-ghost" id="btn-p-photo-gallery" type="button">🖼️ Galerie</button>' +
+            (state.player.photo ? '<button class="btn btn-sm btn-ghost" id="btn-p-photo-remove" type="button">Retirer</button>' : '') +
+          '</div>' +
+        '</div>' +
       '</div>' +
       '<div class="stack" style="margin-top:16px;">' +
         '<button class="btn btn-primary" id="btn-go-map">Rejoindre la carte</button>' +
@@ -1540,6 +1586,20 @@
     document.querySelector(".back").onclick = function(){ state.screen="home"; render(); };
     document.getElementById("p-name").oninput = function(e){ state.player.name = e.target.value; };
     document.getElementById("p-squad").oninput = function(e){ state.player.squad = e.target.value; };
+    document.getElementById("btn-p-photo-camera").onclick = function(){ document.getElementById("p-photo-camera").click(); };
+    document.getElementById("btn-p-photo-gallery").onclick = function(){ document.getElementById("p-photo-gallery").click(); };
+    var removePhotoBtn = document.getElementById("btn-p-photo-remove");
+    if(removePhotoBtn) removePhotoBtn.onclick = function(){ state.player.photo = null; render(); };
+    ["p-photo-camera", "p-photo-gallery"].forEach(function(id){
+      document.getElementById(id).onchange = function(e){
+        var file = e.target.files && e.target.files[0];
+        if(!file) return;
+        resizeImageFile(file, 300, 0.75, function(dataUrl){
+          state.player.photo = dataUrl;
+          render();
+        });
+      };
+    });
 
     var wrap = document.getElementById("team-choices");
     function drawChoices(){
@@ -1568,7 +1628,7 @@
       return found;
     }
 
-    function proceedToMap(){
+    async function proceedToMap(){
       if(state.player.team === "Staff"){ state.player._grantStaffOnJoin = true; }
       state.player.livesRemaining = undefined;
       state.player._wasInSpawn = false;
@@ -1578,6 +1638,7 @@
       state.lastSeenChatTs = 0;
       state.notifUnreadLog = 0;
       state.notifUnreadChat = 0;
+      if(state.player.photo){ await savePlayerPhoto(cfg.code, state.playerId, state.player.photo); }
       state.screen = "map";
       render();
     }
@@ -2511,7 +2572,7 @@
     function paint(){
       el.innerHTML =
         '<div class="field" style="margin-top:0;"><label>Type de point</label>' +
-          '<div class="row">' +
+          '<div class="row" style="flex-wrap:wrap;">' +
             POINT_ICONS.map(function(ic){
               return '<button class="btn btn-sm '+(ic.key===chosenIcon?'btn-primary':'btn-ghost')+'" data-icon="'+ic.key+'">'+ic.emoji+' '+ic.label+'</button>';
             }).join("") +
@@ -2636,9 +2697,11 @@
       (z.photo ? ('<img src="'+z.photo+'" style="width:140px;max-width:140px;height:auto;border-radius:6px;margin-bottom:6px;display:block;" />') : '') +
       '<div class="field" style="margin-top:0;"><label>Notes (détails, accès, etc.)</label>' +
         '<textarea class="zone-info-notes" data-id="'+z.id+'" rows="3" placeholder="Ex. 2 fenêtres, 1 porte, accès par le nord">'+escapeHtml(z.notes||"")+'</textarea></div>' +
-      '<input type="file" accept="image/*" class="zone-info-photo-input" data-id="'+z.id+'" style="display:none;" />' +
-      '<div class="row" style="margin-top:6px;">' +
-        '<button class="btn btn-sm btn-ghost zone-info-photo-btn" data-id="'+z.id+'">📷 '+(z.photo?'Changer la photo':'Ajouter une photo')+'</button>' +
+      '<input type="file" accept="image/*" capture="environment" class="zone-info-photo-camera" data-id="'+z.id+'" style="display:none;" />' +
+      '<input type="file" accept="image/*" class="zone-info-photo-gallery" data-id="'+z.id+'" style="display:none;" />' +
+      '<div class="row" style="margin-top:6px;flex-wrap:wrap;">' +
+        '<button class="btn btn-sm btn-ghost zone-info-photo-camera-btn" data-id="'+z.id+'">📷 Appareil photo</button>' +
+        '<button class="btn btn-sm btn-ghost zone-info-photo-gallery-btn" data-id="'+z.id+'">🖼️ Galerie</button>' +
         (z.photo ? '<button class="btn btn-sm btn-ghost zone-info-photo-remove" data-id="'+z.id+'">Retirer la photo</button>' : '') +
       '</div>' +
       '<div class="row" style="margin-top:8px;">' +
@@ -2648,27 +2711,31 @@
     '</div>';
   }
 
-  // Redimensionne/compresse la photo côté téléphone avant de l'attacher — une photo brute
-  // de smartphone peut peser plusieurs Mo, bien trop pour un bloc Firebase partagé par tous.
-  function resizeAndAttachPhoto(zoneId, file){
+  // Redimensionne/compresse une image côté téléphone — une photo brute de smartphone peut
+  // peser plusieurs Mo, bien trop pour un bloc Firebase partagé par tous. Réutilisée pour
+  // les photos de bâtiments/points ET la photo d'identité du joueur.
+  function resizeImageFile(file, maxDim, quality, callback){
     var reader = new FileReader();
     reader.onload = function(ev){
       var img = new Image();
       img.onload = function(){
-        var maxDim = 800;
         var scale = Math.min(1, maxDim / Math.max(img.width, img.height));
         var canvas = document.createElement("canvas");
         canvas.width = Math.round(img.width * scale);
         canvas.height = Math.round(img.height * scale);
         var ctx = canvas.getContext("2d");
         ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-        var dataUrl = canvas.toDataURL("image/jpeg", 0.7);
-        var z = state.editorZones.find(function(zz){ return zz.id === zoneId; });
-        if(z){ z.photo = dataUrl; drawZoneList(); }
+        callback(canvas.toDataURL("image/jpeg", quality));
       };
       img.src = ev.target.result;
     };
     reader.readAsDataURL(file);
+  }
+  function resizeAndAttachPhoto(zoneId, file){
+    resizeImageFile(file, 800, 0.7, function(dataUrl){
+      var z = state.editorZones.find(function(zz){ return zz.id === zoneId; });
+      if(z){ z.photo = dataUrl; drawZoneList(); }
+    });
   }
 
   var ZONE_GROUP_DEFS = [
@@ -2727,14 +2794,19 @@
     Array.prototype.forEach.call(wrap.querySelectorAll(".zone-info-close"), function(btn){
       btn.onclick = function(){ state.editingInfoZoneId = null; drawZoneList(); };
     });
-    Array.prototype.forEach.call(wrap.querySelectorAll(".zone-info-photo-btn"), function(btn){
+    Array.prototype.forEach.call(wrap.querySelectorAll(".zone-info-photo-camera-btn"), function(btn){
       btn.onclick = function(){
-        var input = wrap.querySelector('.zone-info-photo-input[data-id="'+btn.dataset.id+'"]') ||
-          document.querySelector('.zone-info-photo-input[data-id="'+btn.dataset.id+'"]');
+        var input = wrap.querySelector('.zone-info-photo-camera[data-id="'+btn.dataset.id+'"]');
         if(input) input.click();
       };
     });
-    Array.prototype.forEach.call(wrap.querySelectorAll(".zone-info-photo-input"), function(input){
+    Array.prototype.forEach.call(wrap.querySelectorAll(".zone-info-photo-gallery-btn"), function(btn){
+      btn.onclick = function(){
+        var input = wrap.querySelector('.zone-info-photo-gallery[data-id="'+btn.dataset.id+'"]');
+        if(input) input.click();
+      };
+    });
+    Array.prototype.forEach.call(wrap.querySelectorAll(".zone-info-photo-camera, .zone-info-photo-gallery"), function(input){
       input.onchange = function(e){
         var file = e.target.files && e.target.files[0];
         if(file) resizeAndAttachPhoto(input.dataset.id, file);
@@ -5376,14 +5448,14 @@
     var durations = [ {label:"30s", ms:30000}, {label:"2 min", ms:120000}, {label:"5 min", ms:300000} ];
     el.innerHTML =
       '<p class="mono" style="font-size:10px;color:var(--ink-dim);text-transform:uppercase;margin-top:6px;">Durée</p>' +
-      '<div class="row">' +
+      '<div class="row" style="flex-wrap:wrap;">' +
         durations.map(function(d){
           return '<button class="btn btn-sm '+(state.trailDuration===d.ms?'btn-primary':'btn-ghost')+' trail-dur" data-ms="'+d.ms+'">'+d.label+'</button>';
         }).join("") +
         '<button class="btn btn-sm '+(!state.trailDuration?'btn-primary':'btn-ghost')+' trail-dur" data-ms="0">Désactivée</button>' +
       '</div>' +
       '<p class="mono" style="font-size:10px;color:var(--ink-dim);text-transform:uppercase;margin-top:8px;">Portée</p>' +
-      '<div class="row">' +
+      '<div class="row" style="flex-wrap:wrap;">' +
         '<button class="btn btn-sm '+(state.trailScope==="me"?'btn-primary':'btn-ghost')+' trail-scope" data-scope="me">Moi</button>' +
         (state.player.squad ? ('<button class="btn btn-sm '+(state.trailScope==="squad"?'btn-primary':'btn-ghost')+' trail-scope" data-scope="squad">Mon escouade</button>') : '') +
         '<button class="btn btn-sm '+(state.trailScope==="team"?'btn-primary':'btn-ghost')+' trail-scope" data-scope="team">Mon équipe</button>' +
@@ -5495,8 +5567,12 @@
 
     document.getElementById("roster").innerHTML = rows.map(function(r){
       var activity = playerActivityLabel(r.p);
+      var photo = (state.cachedPlayerPhotos||{})[r.pid];
+      var avatar = photo
+        ? '<img src="'+photo+'" style="width:22px;height:22px;border-radius:50%;object-fit:cover;flex-shrink:0;" />'
+        : '<span class="dot" style="background:'+r.color+'"></span>';
       return '<div class="roster-row'+(r.stale?' stale':'')+'" data-pid="'+r.pid+'">' +
-        '<span class="dot" style="background:'+r.color+'"></span>' +
+        avatar +
         '<span class="name">'+escapeHtml(r.p.name||"?")+(r.pid===state.playerId?'<span class="you">TOI</span>':'')+(r.p.role==="staff"?'<span class="you" style="color:var(--amber);">STAFF</span>':'')+(r.p.sos?'<span class="you" style="color:var(--danger);">🆘 AIDE</span>':'')+(activity?'<span class="mono" style="font-size:10px;color:var(--ink-dim);display:block;">'+activity+'</span>':'')+'</span>' +
         '<span class="dist">'+(r.pid===state.playerId ? "" : fmtDist(r.dist))+'</span>' +
       '</div>';
