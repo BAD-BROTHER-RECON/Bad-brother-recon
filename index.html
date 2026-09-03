@@ -1152,7 +1152,8 @@
           var isChat = item.hasOwnProperty("from");
           var d = new Date(item.ts);
           var hh = ("0"+d.getHours()).slice(-2), mm = ("0"+d.getMinutes()).slice(-2);
-          var label = isChat ? ('💬 '+escapeHtml(item.from||"?")+' : '+(item.text ? escapeHtml(item.text) : "[vocal]")) : logEntryLabel(item);
+          var chanTag = isChat ? (item.to === "global" ? "🌐 " : "🔒 ") : "";
+          var label = isChat ? (chanTag+escapeHtml(item.from||"?")+' : '+(item.text ? escapeHtml(item.text) : "[vocal]")) : logEntryLabel(item);
           return '<p style="font-size:12px;margin-top:4px;">'+label+' <span class="mono" style="font-size:10px;color:var(--ink-dim);">'+hh+':'+mm+'</span></p>';
         }).join("") : '<p style="font-size:12px;color:var(--ink-dim);">Rien de nouveau.</p>') +
         '<div class="row" style="margin-top:8px;">' +
@@ -1417,6 +1418,7 @@
       var ok = await saveEventConfig(cfg);
       if(!ok){ state.lastEventErr = "Impossible de créer l'événement pour l'instant. Réessaie."; render(); return; }
       state.event = cfg;
+      rememberLastEvent(cfg.code);
       state.isOrganizer = true;
       state.orgAccessUnlocked = true; // il vient de choisir ce code lui-même, pas besoin de le retaper
       state.lastEventErr = "";
@@ -1511,6 +1513,7 @@
       if(!cfg){ state.lastEventErr = "Aucun événement trouvé pour ce code."; render(); return; }
       stopScan();
       state.event = cfg;
+      rememberLastEvent(cfg.code);
       state.lastEventErr = "";
       state.screen = "team";
       render();
@@ -4290,7 +4293,7 @@
       '<div class="roster" id="roster"></div>' +
       '<div id="admin-actions" class="row" style="margin-top:10px;flex-wrap:wrap;"></div>';
 
-    document.querySelector(".back").onclick = function(){ teardownMap(); state.screen="home"; render(); };
+    document.querySelector(".back").onclick = function(){ teardownMap(); forgetLastEvent(); state.screen="home"; render(); };
     document.getElementById("test-mode").onchange = function(e){ state.testMode = e.target.checked; applyGeoMode(); };
     setupCompassDial();
     document.getElementById("btn-compass-reset").onclick = function(){
@@ -4556,15 +4559,24 @@
     if(mapEl) mapEl.style.transform = "translate(-50%,-50%) rotate(" + (-state.compassAngle) + "deg)";
     document.documentElement.style.setProperty("--compass-angle", state.compassAngle + "deg");
 
-    // Déplacer la carte au doigt pendant qu'elle est tournée inverserait le sens du geste
-    // (haut/bas, gauche/droite) — on désactive donc le glissement tant qu'elle n'est pas
-    // orientée Nord en haut, pour éviter cette confusion. Le zoom (pincement) reste possible.
-    var isNorth = (state.compassAngle < 2 || state.compassAngle > 358);
-    if(state.map){
-      if(isNorth) state.map.dragging.enable(); else state.map.dragging.disable();
-    }
+    // Le déplacement reste actif à toute orientation — le désactiver bloquait aussi la
+    // loupe (qui dépend du déplacement de la carte principale pour changer ce qu'elle
+    // affiche), la rendant inutilisable dès que la carte n'était plus Nord en haut.
+    if(state.map && !state.map.dragging.enabled()) state.map.dragging.enable();
     var hint = document.getElementById("compass-drag-hint");
-    if(hint) hint.textContent = isNorth ? "" : "Déplacement désactivé pendant la rotation — remets Nord en haut pour te déplacer.";
+    if(hint) hint.textContent = "";
+  }
+
+  // Force Leaflet à repositionner chaque marqueur (et son étiquette de nom) après une
+  // rotation : sans ça, une étiquette déjà affichée peut rester figée à sa position d'avant
+  // la rotation tant que le joueur concerné ne bouge pas assez pour déclencher une vraie
+  // mise à jour GPS. setLatLng() force ce recalcul via l'API publique de Leaflet.
+  function refreshMarkerPositions(){
+    if(!state.markers) return;
+    Object.keys(state.markers).forEach(function(pid){
+      var m = state.markers[pid];
+      if(m && m.getLatLng) m.setLatLng(m.getLatLng());
+    });
   }
 
   function setupCompassDial(){
@@ -4592,7 +4604,7 @@
       state.compassAngle = angleFromPoint(e.clientX, e.clientY);
       applyCompassRotation();
     });
-    dial.addEventListener("pointerup", function(){ dragging = false; });
+    dial.addEventListener("pointerup", function(){ dragging = false; refreshMarkerPositions(); });
     dial.addEventListener("pointercancel", function(){ dragging = false; });
   }
 
@@ -4629,7 +4641,7 @@
       }
     }, { passive:true });
     mapEl.addEventListener("touchend", function(e){
-      if(e.touches.length < 2) startAngle = null;
+      if(e.touches.length < 2){ startAngle = null; refreshMarkerPositions(); }
     }, { passive:true });
     mapEl.addEventListener("touchcancel", function(){ startAngle = null; }, { passive:true });
   }
@@ -5640,13 +5652,45 @@
     }, 300);
   });
 
+  // ---------- Reprise automatique après rafraîchissement accidentel (tirer-pour-actualiser) ----------
+  // Un rafraîchissement de la page (geste "tirer vers le bas" sur mobile) réinitialise tout
+  // l'état JS — sans ceci, on retombe sur l'écran d'intro/accueil en pleine partie. On ne
+  // garde en mémoire que le CODE de l'événement ; le reste (nom/équipe/escouade) est relu
+  // directement depuis la fiche du joueur sur Firebase, via le playerId déjà stable.
+  function rememberLastEvent(code){
+    try{ localStorage.setItem("badRecon_lastEventCode", code); }catch(e){}
+  }
+  function forgetLastEvent(){
+    try{ localStorage.removeItem("badRecon_lastEventCode"); }catch(e){}
+  }
+  async function attemptAutoRejoin(){
+    var code;
+    try{ code = localStorage.getItem("badRecon_lastEventCode"); }catch(e){ return false; }
+    if(!code) return false;
+    var cfg = await loadEventConfig(code);
+    if(!cfg){ forgetLastEvent(); return false; }
+    var playerRecord = await rawStorageGet(eventPlayerKey(code, state.playerId));
+    if(!playerRecord || !playerRecord.name || !playerRecord.team){ return false; }
+    state.event = cfg;
+    state.player.name = playerRecord.name;
+    state.player.team = playerRecord.team;
+    state.player.squad = playerRecord.squad || "";
+    state.screen = "map";
+    return true;
+  }
+
   // Ouverture via un lien de partage (🔗) : "?map=<id>" — direction directe vers la bibliothèque.
+  // Sinon, on tente d'abord de reprendre automatiquement la dernière partie en cours (utile
+  // après un rafraîchissement accidentel de la page) avant d'afficher quoi que ce soit.
   try{
     var sharedMapId = new URLSearchParams(location.search).get("map");
-    if(sharedMapId){ state.screen = "library"; state.pendingLibraryHighlight = sharedMapId; }
-  }catch(e){}
-
-  render();
+    if(sharedMapId){
+      state.screen = "library"; state.pendingLibraryHighlight = sharedMapId;
+      render();
+    } else {
+      attemptAutoRejoin().then(function(){ render(); });
+    }
+  }catch(e){ render(); }
 })();
 </script>
 </body>
