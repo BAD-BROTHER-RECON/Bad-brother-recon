@@ -5080,7 +5080,10 @@
 
     updateAdminUI();
     updateStaffUI(amStaff);
-    updateTestModeUI(state.isOrganizer || amStaff);
+    // Mode test suit le même verrou que Éditer carte/Rôles/Mode de jeu : si un code d'accès
+    // a été défini et n'a pas encore été retapé pour cette session, même le créateur ne
+    // l'a plus tant qu'il n'a pas rejoint en Staff ou re-saisi son propre code.
+    updateTestModeUI((state.isOrganizer || amStaff) && !requiresOrgAccess());
 
     var adminEntry = vis.adminId ? players[vis.adminId] : null;
     var adminGone = !state.isOrganizer && (!vis.adminId || !adminEntry || (Date.now() - (adminEntry.ts||0)) > 600000);
