@@ -420,6 +420,7 @@
     squadOnly: false,
     compassAngle: 0,
     rotationLocked: false,
+    wakeLock: null,
     mapFullscreen: false,
     followMe: false,
     loupeLive: null,
@@ -1065,6 +1066,8 @@
     if(state.screen === "intro") return renderIntro();
     if(state.screen === "log") return renderLog();
     if(state.screen === "chat") return renderChat();
+    if(state.screen === "recap") return renderRecap();
+    if(state.screen === "eventhistory") return renderEventHistory();
     if(state.screen === "gamemode") return renderGameMode();
   }
 
@@ -1233,6 +1236,41 @@
     }, 3300);
   }
 
+  // ---------- Historique des parties organisées (sur cet appareil) ----------
+  function loadEventHistory(){
+    try{ return JSON.parse(localStorage.getItem("badRecon_eventHistory") || "[]"); }catch(e){ return []; }
+  }
+  function addEventHistoryEntry(code, name){
+    try{
+      var hist = loadEventHistory();
+      hist = hist.filter(function(h){ return h.code !== code; }); // évite un doublon, la fait remonter en tête
+      hist.unshift({ code: code, name: name, createdAt: Date.now() });
+      if(hist.length > 20) hist = hist.slice(0, 20);
+      localStorage.setItem("badRecon_eventHistory", JSON.stringify(hist));
+    }catch(e){}
+  }
+  function renderEventHistory(){
+    var hist = loadEventHistory();
+    app.innerHTML =
+      '<div class="topbar"><button class="back">‹ Retour</button><div class="eyebrow">📜 Mes parties organisées</div></div>' +
+      (hist.length ? hist.map(function(h){
+        var d = new Date(h.createdAt);
+        var dateStr = ("0"+d.getDate()).slice(-2)+"/"+("0"+(d.getMonth()+1)).slice(-2)+"/"+d.getFullYear();
+        return '<div class="zone-row" style="flex-wrap:wrap;gap:6px;">' +
+          '<span class="name">'+escapeHtml(h.name||"Sans nom")+' <span class="mono" style="font-size:10px;color:var(--ink-dim);">· '+escapeHtml(h.code)+' · '+dateStr+'</span></span>' +
+          '<button class="btn btn-sm btn-ghost hist-rejoin" data-code="'+escapeHtml(h.code)+'">Rejoindre</button>' +
+        '</div>';
+      }).join("") : '<p>Aucune partie organisée pour l\u2019instant. Elles apparaîtront ici dès que tu en crées une.</p>');
+    document.querySelector(".back").onclick = function(){ state.screen="home"; render(); };
+    Array.prototype.forEach.call(document.querySelectorAll(".hist-rejoin"), function(btn){
+      btn.onclick = function(){
+        state.joinCodeDraft = btn.dataset.code;
+        state.screen = "join";
+        render();
+      };
+    });
+  }
+
   function renderHome(){
     app.innerHTML =
       '<div class="hero">' +
@@ -1252,6 +1290,7 @@
         '<button class="btn" id="btn-join">Rejoindre une partie</button>' +
         '<div class="eyebrow" style="margin-top:8px;">Terrains</div>' +
         '<button class="btn btn-ghost" id="btn-library">📚 Bibliothèque de cartes</button>' +
+        '<button class="btn btn-ghost" id="btn-event-history">📜 Mes parties organisées</button>' +
       '</div>' +
       (LIBS_OK.leaflet && LIBS_OK.qrcode && LIBS_OK.jsqr ? '' :
         '<div class="banner warn">Certaines ressources externes (carte, QR) n\'ont pas pu se charger. Vérifie ta connexion internet et recharge la page.</div>') +
@@ -1263,6 +1302,7 @@
     document.getElementById("btn-create").onclick = function(){ state.screen="create"; render(); };
     document.getElementById("btn-join").onclick = function(){ state.screen="join"; render(); };
     document.getElementById("btn-library").onclick = function(){ state.screen="library"; render(); };
+    document.getElementById("btn-event-history").onclick = function(){ state.screen="eventhistory"; render(); };
   }
 
   // Demande position + caméra en un seul geste (un seul bouton, un seul aller-retour
@@ -1420,6 +1460,7 @@
       if(!ok){ state.lastEventErr = "Impossible de créer l'événement pour l'instant. Réessaie."; render(); return; }
       state.event = cfg;
       rememberLastEvent(cfg.code);
+      addEventHistoryEntry(cfg.code, cfg.name);
       state.isOrganizer = true;
       state.orgAccessUnlocked = true; // il vient de choisir ce code lui-même, pas besoin de le retaper
       state.lastEventErr = "";
@@ -3775,6 +3816,69 @@
     if(state.chatPollTimer){ clearInterval(state.chatPollTimer); state.chatPollTimer = null; }
   }
 
+  // ---------- Récap (score final, captures, éliminations, objectifs) ----------
+  function renderRecap(){
+    app.innerHTML =
+      '<div class="topbar"><button class="back">‹ Retour</button><div class="eyebrow">📊 Récap</div></div>' +
+      '<div id="recap-content"><p class="mono" style="font-size:11px;color:var(--ink-dim);">Chargement…</p></div>';
+    document.querySelector(".back").onclick = function(){ state.screen="map"; render(); };
+    loadRecap();
+  }
+
+  async function loadRecap(){
+    var el = document.getElementById("recap-content");
+    if(!el || !state.event) return;
+    var code = state.event.code;
+    var log = await loadEventLog(code);
+    var score = await loadScore(code);
+    var amPrivileged = state.isOrganizer || state.player.role === "staff";
+    var myTeam = state.player.team;
+    // Même filtrage que le Journal : un joueur simple ne voit que ce qui concerne son
+    // équipe (plus les événements généraux), le staff/organisateur voit tout.
+    var visibleLog = log.filter(function(e){ return amPrivileged || !e.team || e.team === myTeam; });
+
+    var captures = {}, eliminations = {}, objectivesDone = 0, sosCount = 0;
+    visibleLog.forEach(function(e){
+      if(e.type === "flag_capture") captures[e.team] = (captures[e.team]||0) + 1;
+      if(e.type === "deathmatch_out" && e.team) eliminations[e.team] = (eliminations[e.team]||0) + 1;
+      if(e.type === "objective_complete") objectivesDone++;
+      if(e.type === "sos") sosCount++;
+    });
+
+    var teamSet = {};
+    Object.keys(score||{}).forEach(function(t){ if(t !== "Staff") teamSet[t] = true; });
+    Object.keys(captures).forEach(function(t){ teamSet[t] = true; });
+    Object.keys(eliminations).forEach(function(t){ teamSet[t] = true; });
+    var allTeams = Object.keys(teamSet).sort(function(a,b){ return (score[b]||0) - (score[a]||0); });
+
+    if(!allTeams.length && !objectivesDone && !sosCount){
+      el.innerHTML = '<p>Rien à récapituler pour l\u2019instant.</p>';
+      return;
+    }
+
+    el.innerHTML =
+      '<div class="panel"><label class="mono" style="font-size:10px;color:var(--ink-dim);text-transform:uppercase;">Score final</label>' +
+        (allTeams.length ? allTeams.map(function(t){
+          var col = teamColor(state.event || {}, t);
+          return '<div class="zone-row"><span class="dot" style="background:'+col+'"></span><span class="name">'+escapeHtml(t)+'</span><span class="mono" style="font-weight:700;">'+Math.round(score[t]||0)+' pts</span></div>';
+        }).join("") : '<p style="font-size:12px;color:var(--ink-dim);">Aucun score enregistré.</p>') +
+      '</div>' +
+      '<div class="panel" style="margin-top:10px;"><label class="mono" style="font-size:10px;color:var(--ink-dim);text-transform:uppercase;">🚩 Captures de drapeau</label>' +
+        (Object.keys(captures).length ? Object.keys(captures).map(function(t){
+          return '<div class="zone-row"><span class="name">'+escapeHtml(t)+'</span><span class="mono">'+captures[t]+'</span></div>';
+        }).join("") : '<p style="font-size:12px;color:var(--ink-dim);">Aucune capture.</p>') +
+      '</div>' +
+      '<div class="panel" style="margin-top:10px;"><label class="mono" style="font-size:10px;color:var(--ink-dim);text-transform:uppercase;">☠️ Éliminations</label>' +
+        (Object.keys(eliminations).length ? Object.keys(eliminations).map(function(t){
+          return '<div class="zone-row"><span class="name">'+escapeHtml(t)+'</span><span class="mono">'+eliminations[t]+'</span></div>';
+        }).join("") : '<p style="font-size:12px;color:var(--ink-dim);">Aucune élimination.</p>') +
+      '</div>' +
+      '<div class="panel" style="margin-top:10px;"><label class="mono" style="font-size:10px;color:var(--ink-dim);text-transform:uppercase;">Autres</label>' +
+        '<p style="font-size:12px;">📂 Objectifs atteints : <b>'+objectivesDone+'</b></p>' +
+        '<p style="font-size:12px;">🆘 SOS déclenchés : <b>'+sosCount+'</b></p>' +
+      '</div>';
+  }
+
   function renderLog(){
     var amPrivileged = state.isOrganizer || state.player.role === "staff";
     state.lastSeenLogTs = Date.now();
@@ -3896,7 +4000,17 @@
     var timers = await loadTimers(code);
 
     el.innerHTML =
-      '<div class="panel"><div class="zone-row"><span class="name">🚩 Capture de drapeau</span></div>' +
+      '<div class="panel" style="background:rgba(201,162,39,.06);">' +
+        '<label class="mono" style="font-size:10px;color:var(--ink-dim);text-transform:uppercase;">🎯 Modèles rapides</label>' +
+        '<p style="margin-top:4px;font-size:12px;">Configure une mécanique d\u2019un coup avec des réglages de base — à ajuster ensuite si besoin.</p>' +
+        '<div class="row" style="margin-top:8px;flex-wrap:wrap;">' +
+          '<button class="btn btn-sm btn-ghost" id="btn-tpl-capture">🚩 Capture classique</button>' +
+          '<button class="btn btn-sm btn-ghost" id="btn-tpl-deathmatch">☠️ Match à mort</button>' +
+          '<button class="btn btn-sm btn-ghost" id="btn-tpl-br">☢️ Battle Royale</button>' +
+        '</div>' +
+        '<div id="tpl-banner"></div>' +
+      '</div>' +
+      '<div class="panel" style="margin-top:10px;"><div class="zone-row"><span class="name">🚩 Capture de drapeau</span></div>' +
         '<p style="font-size:12px;color:var(--ink-dim);">'+(flagCount ? (flagCount+' drapeau(x) sur la carte') : 'Aucun drapeau pour l\u2019instant.')+'</p>' +
         '<button class="btn btn-sm btn-ghost" id="btn-gm-flags">Gérer dans l\u2019éditeur</button>' +
         '<div id="capture-settings-panel" style="margin-top:8px;"></div>' +
@@ -3957,6 +4071,40 @@
     renderScenarioPanel(zones);
     renderTimersPanel(timers);
     renderCaptureSettingsPanel();
+
+    document.getElementById("btn-tpl-capture").onclick = async function(){
+      state.event.captureBaseMinutes = 10;
+      state.event.scoreIntervalSeconds = 30;
+      state.event.scorePointsPerInterval = 1;
+      state.event.scoreLimit = null;
+      state.event.timeLimitMinutes = 30;
+      await saveEventConfig(state.event);
+      document.getElementById("tpl-banner").innerHTML = '<div class="banner info">Réglages de capture classique appliqués (10 min de base, 30 min de partie).</div>';
+      loadGameModeSummary();
+    };
+    document.getElementById("btn-tpl-deathmatch").onclick = async function(){
+      state.event.deathmatchEnabled = true;
+      state.event.deathmatchLives = 3;
+      await saveEventConfig(state.event);
+      document.getElementById("tpl-banner").innerHTML = '<div class="banner info">Match à mort activé — 3 vies par joueur.</div>';
+      loadGameModeSummary();
+    };
+    document.getElementById("btn-tpl-br").onclick = async function(){
+      state.event.deathmatchEnabled = true;
+      state.event.deathmatchLives = 1;
+      await saveEventConfig(state.event);
+      var hasGas = zones.some(function(z){ return z.kind === "gaz"; });
+      if(!hasGas && state.event.center){
+        zones.push({
+          id: genId("gas"), kind: "gaz", name: "Gaz (Battle Royale)", center: state.event.center,
+          initialRadius: 15, growAmount: 25, phaseMinutes: 5, maxRadius: null,
+          startAt: Date.now(), frozenRadius: null
+        });
+        await saveZones(code, zones);
+      }
+      document.getElementById("tpl-banner").innerHTML = '<div class="banner info">Battle Royale activé — 1 vie par joueur'+(hasGas ? '' : ', gaz évolutif créé au centre de la carte')+'.</div>';
+      loadGameModeSummary();
+    };
   }
 
   // ---------- Panneau de configuration du Scénario personnalisé (organisateur) ----------
@@ -4287,6 +4435,7 @@
         '<button class="btn btn-sm '+(state.trailDuration?'btn-primary':'btn-ghost')+'" id="btn-trail-menu">🛤️ Trajectoire</button>' +
         '<button class="btn btn-sm btn-ghost" id="btn-log-player">📋 Journal</button>' +
         '<button class="btn btn-sm btn-ghost" id="btn-chat-player">💬 Chat</button>' +
+        '<button class="btn btn-sm btn-ghost" id="btn-recap-player">📊 Récap</button>' +
       '</div>' +
       '<div id="ping-menu"></div>' +
       '<div id="trail-menu"></div>' +
@@ -4362,6 +4511,7 @@
     document.getElementById("battery-saver-toggle").onchange = function(e){
       state.batterySaverMode = e.target.checked;
       restartPolling();
+      if(state.batterySaverMode) releaseWakeLock(); else requestWakeLock();
     };
     document.getElementById("roster-search").oninput = function(e){ state.rosterSearch = e.target.value; refreshPlayers(); };
     document.getElementById("btn-sos").onclick = async function(){
@@ -4416,6 +4566,11 @@
       state.screen = "chat";
       render();
     };
+    document.getElementById("btn-recap-player").onclick = function(){
+      teardownMap();
+      state.screen = "recap";
+      render();
+    };
 
     if(!LIBS_OK.leaflet){
       document.getElementById("map").outerHTML = '<div class="banner warn">La carte n\'a pas pu se charger (librairie indisponible). Vérifie ta connexion.</div>';
@@ -4467,6 +4622,7 @@
     refreshZones();
     refreshPings();
     startWarzoneTicker();
+    requestWakeLock();
   }
 
   // ---------- Rafraîchissement adapté à la batterie ----------
@@ -4975,9 +5131,50 @@
     var note = document.getElementById("vis-note");
     if(note) note.textContent = restricted ? "Vision limitée à ton équipe (sauf déblocage par le staff)." : "";
 
+    checkForNewSos(visible);
     updateMarkers(visible);
     updateRoster(visible);
     updateLivesBoard(players);
+  }
+
+  // ---------- Alerte (son + vibration) quand un SOS apparaît ----------
+  // Ne se déclenche que sur une VRAIE nouvelle demande d'aide (pas à chaque cycle tant
+  // qu'elle reste active), et jamais pour son propre SOS.
+  function checkForNewSos(visible){
+    if(!state.knownSosIds) state.knownSosIds = {};
+    var currentIds = {};
+    var newSos = false;
+    Object.keys(visible).forEach(function(pid){
+      var p = visible[pid];
+      if(p && p.sos){
+        currentIds[pid] = true;
+        if(!state.knownSosIds[pid] && pid !== state.playerId) newSos = true;
+      }
+    });
+    state.knownSosIds = currentIds;
+    if(newSos){ vibrateAlert(); playAlertBeep(); }
+  }
+  function vibrateAlert(){
+    try{ if(navigator.vibrate) navigator.vibrate([200,100,200,100,200]); }catch(e){}
+  }
+  // Bip généré à la volée (aucun fichier audio à charger) — deux notes courtes, assez
+  // aiguës pour être audibles même dans un environnement bruyant type terrain.
+  function playAlertBeep(){
+    try{
+      var ctx = state.audioCtx || (state.audioCtx = new (window.AudioContext || window.webkitAudioContext)());
+      [0, 0.22].forEach(function(delay){
+        var osc = ctx.createOscillator();
+        var gain = ctx.createGain();
+        osc.type = "sine";
+        osc.frequency.value = 880;
+        gain.gain.setValueAtTime(0.0001, ctx.currentTime + delay);
+        gain.gain.exponentialRampToValueAtTime(0.35, ctx.currentTime + delay + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + delay + 0.18);
+        osc.connect(gain); gain.connect(ctx.destination);
+        osc.start(ctx.currentTime + delay);
+        osc.stop(ctx.currentTime + delay + 0.2);
+      });
+    }catch(e){ /* AudioContext indisponible ou bloqué — on continue sans son */ }
   }
 
   // ---------- Capture de drapeaux (façon "Domination" : occupation exclusive requise) ----------
@@ -5651,7 +5848,32 @@
     state.trailDuration = 0;
     state.trailScope = null;
     state.pingPlacingKind = null;
+    releaseWakeLock();
+    state.knownSosIds = null;
   }
+
+  // ---------- Écran maintenu actif pendant la partie ----------
+  // Sans ça, le téléphone peut se verrouiller tout seul et couper le suivi GPS en plein
+  // milieu d'une partie. Respecte le mode économie de batterie choisi par le joueur : s'il
+  // l'a activé, on ne force pas l'écran à rester allumé.
+  async function requestWakeLock(){
+    if(state.batterySaverMode) return;
+    if(!('wakeLock' in navigator)) return;
+    try{
+      state.wakeLock = await navigator.wakeLock.request('screen');
+      state.wakeLock.addEventListener('release', function(){ state.wakeLock = null; });
+    }catch(e){ /* refusé (économie d'énergie système, etc.) — on continue sans, silencieusement */ }
+  }
+  function releaseWakeLock(){
+    if(state.wakeLock){ state.wakeLock.release().catch(function(){}); state.wakeLock = null; }
+  }
+  // Le wake lock est automatiquement relâché par le navigateur quand l'onglet passe en
+  // arrière-plan — on le redemande dès qu'on revient dessus, si on est toujours sur la carte.
+  document.addEventListener('visibilitychange', function(){
+    if(document.visibilityState === 'visible' && state.screen === 'map' && !state.wakeLock){
+      requestWakeLock();
+    }
+  });
 
   // Quand l'appli est vraiment fermée (onglet fermé, appli quittée) : on arrête le GPS et les
   // envois de position pour ne pas gaspiller batterie/données. On NE supprime PAS le joueur de
