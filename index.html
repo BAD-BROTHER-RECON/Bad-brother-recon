@@ -1068,6 +1068,7 @@
     if(state.screen === "chat") return renderChat();
     if(state.screen === "recap") return renderRecap();
     if(state.screen === "eventhistory") return renderEventHistory();
+    if(state.screen === "notice") return renderNotice();
     if(state.screen === "gamemode") return renderGameMode();
   }
 
@@ -1271,6 +1272,66 @@
     });
   }
 
+  // ---------- Notice informative (fun) affichée avant les permissions ----------
+  function renderNotice(){
+    app.innerHTML =
+      '<div class="topbar"><button class="back">‹ Retour</button><div class="eyebrow">📖 La notice</div></div>' +
+      '<div class="stack">' +
+        '<div style="text-align:center;font-size:40px;">🔫</div>' +
+        '<h1 class="hero-title" style="text-align:center;">BAD BROTHER RECON</h1>' +
+        '<p style="text-align:center;color:var(--ink-dim);font-size:12px;">La notice qu\u2019on a pondue entre deux parties, pas dans un open space avec kombucha et post-it colorés</p>' +
+
+        '<p style="margin-top:14px;">SALUT LES BROTHERS. 🫡🔥</p>' +
+        '<p>Posez vos répliques trente secondes, arrêtez de mordre dans votre barre énergétique périmée, on a un truc IMPORTANT à vous montrer. Après des mois de café froid, de "attends ça buggait pas hier", de "Robert t\u2019as encore désinstallé Chrome ?" et d\u2019un nombre de tests solo qui frôle carrément le diagnostic psychiatrique, voici enfin la doc officielle™®© de <b>Bad Brother Recon</b> — l\u2019appli qui vous localise sur le terrain (dans le bon sens du terme, on n\u2019est pas des stalkers, on a juste l\u2019air) et qui, en prime, organise toute la partie pendant que vous, vous n\u2019avez qu\u2019à courir, crier, et vous prendre pour Rambo pendant deux heures.</p>' +
+        '<p style="color:var(--amber-dim);font-size:12px;"><b>DISCLAIMER LÉGAL, MORAL ET SPIRITUEL</b> : on n\u2019est ni Steve Jobs, ni Mark Zuckerberg, ni même le CV rejeté du stagiaire de Zuckerberg. C\u2019est un prototype fait maison, cuisiné à la sueur, à l\u2019énergie liquide premier prix et à un café tellement froid qu\u2019il a développé sa propre conscience. Testé principalement par une seule personne, seule sur un terrain vague, en train de crier "GREM, T\u2019ES OÙ ?!" à son propre téléphone posé sur un muret, comme un déséquilibré en pleine reconquête amoureuse avec son GPS.</p>' +
+        '<p>Si un bouton fait n\u2019importe quoi : c\u2019est nous, pas vous. Respirez. On répare vite. Généralement. Souvent. Un jour. 🛠️🔥</p>' +
+
+        '<div class="eyebrow" style="margin-top:16px;">🎯 C\u2019est quoi ce délire</div>' +
+        '<p>Chaque brother ouvre le lien, tape le code de la partie, et <b>BAM 💥</b> — toute l\u2019équipe apparaît en direct sur une vraie carte, comme un drone de reconnaissance militaire sauf que le drone c\u2019est votre iPhone à 40% de batterie et une coque fissurée depuis 2023. Pas d\u2019appli à télécharger, pas de compte à créer, pas de newsletter à refuser douze fois, pas de "acceptez les cookies" écrit en police taille 4. Ça tourne dans le navigateur, point, comme au bon vieux temps où internet marchait encore normalement.</p>' +
+
+        '<div class="eyebrow" style="margin-top:16px;">🚀 Le briefing de mission (3 étapes, même ROBERT y arrive)</div>' +
+        '<p>1. <b>Le chef d\u2019opération</b> (l\u2019organisateur, celui qui a le melon) crée la partie, choisit le terrain et les équipes → reçoit un code secret digne de la CIA, du Mossad, et de votre groupe de mamies au Scrabble réunis.</p>' +
+        '<p>2. <b>Les brothers</b> rentrent le code, choisissent un pseudo qui claque (ou pas, on ne juge pas, "Robert" ça fonctionne aussi) et une équipe.</p>' +
+        '<p>3. Vous autorisez la localisation (oui c\u2019est nécessaire, non on ne vend pas vos données à des Russes, des Chinois, ni même à votre belle-mère), et hop — vous existez sur la carte. Bienvenue au monde. Félicitations, vous êtes un pixel maintenant.</p>' +
+
+        '<div class="eyebrow" style="margin-top:16px;">🗺️ La carte en direct — votre nouveau troisième œil (le premier était de trop de toute façon)</div>' +
+        '<p>Toi et ton équipe, en temps réel, mis à jour toutes les quelques secondes. Plus besoin de gueuler "T\u2019ES OÙ ?!" dans le talkie entre deux grésillements, la carte le sait mieux que toi. Elle sait même des trucs que TU ne sais pas sur toi-même.</p>' +
+        '<p><b>Rotation manuelle</b> : tourne TA carte comme tu veux avec le petit cadran — ça ne bouge QUE chez toi, chacun voit midi à sa porte, personne ne peut faire tourner l\u2019écran des autres (on n\u2019est pas des sorciers, juste des développeurs fatigués). Complètement perdu après avoir tourné dans tous les sens comme un Beyblade en pleine crise existentielle ? Un tap sur "Nord en haut" et ton monde redevient logique, presque rassurant. Ton téléphone qui se fait bousculer dans la poche et qui tourne tout seul comme un possédé sorti d\u2019un film d\u2019exorcisme ? 🔒 <b>Bloquer la rotation</b>, et te voilà tranquille, zen, en paix avec l\u2019univers.</p>' +
+        '<p><b>La loupe 🔍</b> : zoom chirurgical autour de toi pour poser un ping ou juger une distance au mètre près, façon sniper qui calcule le vent, la rotation terrestre et son karma (sauf que c\u2019est juste un tap sur l\u2019écran, calmez-vous).</p>' +
+        '<p>L\u2019équipe adverse ? Invisible. Comme s\u2019ils n\u2019existaient pas. Comme un ex qu\u2019on a bloqué partout. Jusqu\u2019à ce qu\u2019ils vous tirent dessus depuis un buisson, évidemment, là ils existent très fort d\u2019un coup.</p>' +
+
+        '<div class="eyebrow" style="margin-top:16px;">💬 Pour causer sans se faire repérer (ou juste pour clasher gentiment)</div>' +
+        '<p><b>Chat équipe</b> privé, même le staff n\u2019y met pas le nez (promis, juré, craché, main sur le cœur) — et <b>Chat Global</b> pour insulter affectueusement l\u2019équipe adverse entre deux manches, façon trash talk de cour de récré mais avec des adultes qui ont un travail le lundi.</p>' +
+        '<p>Message vocal si t\u2019as la flemme de taper en courant comme un dératé poursuivi par ses propres choix de vie.</p>' +
+        '<p><b>Pings 📍</b> : balance un repère tactique (ennemi repéré, objectif, gaz, mec blessé qui gémit dramatiquement) visible que par ton équipe. Discrétion garantie, contrairement à Kevin qui gueule "JE LE VOIS" à 40 décibels.</p>' +
+        '<p><b>🆘 SOS</b> : un tap, et ça vibre + ça bipe chez toute ton équipe (et chez le staff, qui voit toujours tout, tel un dieu grec un peu blasé). Impossible à louper, même pour le mec qui a le son coupé, le téléphone dans la poche, ET les écouteurs vissés à fond. L\u2019équipe adverse, elle, n\u2019en sait strictement rien — logique, ils ne te voient déjà pas sur leur carte, encore moins ton drame intérieur.</p>' +
+        '<p><b>Journal</b> : l\u2019historique complet, capture par capture, élimination par élimination — l\u2019arbitre impartial qui règle les débats de comptoir d\u2019après-partie, du style "NON C\u2019EST MOI QUI T\u2019AI EU EN PREMIER".</p>' +
+
+        '<div class="eyebrow" style="margin-top:16px;">🎮 Les modes de jeu — choisis ton chaos</div>' +
+        '<p>Capture de drapeau, Warzone, mode Zombie (courez, courez, ne vous retournez pas, c\u2019est du cinéma 101), Match à mort, scénario perso avec objectifs planqués façon chasse au trésor version militaire pour adultes qui refusent de grandir (nous inclus). Pressés ? Les <b>Modèles rapides</b> (🚩 Capture classique, ☠️ Match à mort, ☢️ Battle Royale) montent tout ça en un tap, pas besoin de remplir un formulaire administratif en trois exemplaires avec cachet de la mairie. Et si vous êtes trop feignants même pour ÇA, l\u2019appli <b>génère un scénario toute seule</b> selon le nombre de joueurs et le temps dispo. Merci qui ? Merci l\u2019appli. De rien.</p>' +
+
+        '<div class="eyebrow" style="margin-top:16px;">🛠️ Pour le chef d\u2019opération et son état-major (staff)</div>' +
+        '<p><b>Éditeur de carte</b> : dessine le terrain, les bâtiments, les zones de spawn, plante des points d\u2019intérêt avec photo et note ("l\u2019objectif est planqué là, bonne chance, que la force soit avec toi"). Un vrai PowerPoint de guerre, sauf que contrairement à un PowerPoint, celui-ci sert vraiment à quelque chose et personne ne s\u2019endort dessus.</p>' +
+        '<p><b>Code d\u2019accès</b> : file-le à ton staff pour débloquer édition, rôles et Mode de jeu. Sans lui, même TOI le créateur suprême et tout-puissant, tu perds ces pouvoirs une fois en jeu — histoire que "je suis l\u2019organisateur donc je fais ce que je veux" ne soit plus une excuse valable, Kevin, on te voit venir.</p>' +
+        '<p><b>Mode test</b> (staff/orga only) : simule ta position en tapant sur la carte, pour préparer une partie depuis ton canapé, en pyjama, chaussettes dépareillées, sans bouger un seul orteil. Le rêve.</p>' +
+
+        '<div class="eyebrow" style="margin-top:16px;">✨ Le confort bonus, parce qu\u2019on vous aime bien (un peu)</div>' +
+        '<p><b>Photo d\u2019identité</b> à l\u2019inscription — pour enfin savoir qui est qui quand vous êtes quinze sur le terrain et que la moitié s\u2019est renommée FOX, DELTA, TANGO ou CHARLIE parce que ça sonnait cool sur le moment.</p>' +
+        '<p><b>📊 Récap de fin de partie</b> : score final, captures, éliminations. Pour clore DÉFINITIVEMENT le débat sur qui a vraiment gagné (spoiler : c\u2019est rarement celui qui gueule le plus fort, désolé Kevin, encore lui).</p>' +
+        '<p><b>📜 Historique des parties</b> : retrouve le code d\u2019une ancienne partie sans scroller comme un archéologue dans 400 messages WhatsApp remplis de mèmes et de "on est où".</p>' +
+        '<p><b>Écran qui reste allumé</b> pendant que vous jouez, et <b>mode économie de batterie</b> pour ceux dont le téléphone est déjà en soins palliatifs à midi et réclame l\u2019extrême-onction.</p>' +
+        '<p><b>Bibliothèque de cartes</b> : un terrain dessiné une fois peut resservir (ou être partagé) la prochaine fois. Pas besoin de tout redessiner comme un moine copiste au fond d\u2019un monastère qui a fait vœu de silence et de cartographie.</p>' +
+
+        '<div class="eyebrow" style="margin-top:16px;">🤙 Le mot de la fin (celui qu\u2019on met toujours à la fin, comme au ciné, restez après le générique il y a peut-être une scène bonus)</div>' +
+        '<p>C\u2019est fait maison, ça évolue à chaque partie, et vos retours — même les "ça marche pas du tout wesh, j\u2019ai tout perdu, je me suis pris un arbre" — nous aident à corriger le tir. Merci d\u2019être les cobayes officiels, pardon, les <b>testeurs professionnels hautement qualifiés et non rémunérés</b>.</p>' +
+        '<p style="margin-bottom:20px;"><b>Bonne chasse, visez bien, hydratez-vous, et n\u2019oubliez pas : c\u2019est un jeu, pas une vendetta personnelle contre votre cousin ni contre Robert, même s\u2019il l\u2019a bien cherché. 🎯💀</b></p>' +
+
+        '<button class="btn btn-primary" id="btn-notice-done">C\u2019est noté, go 🫡</button>' +
+      '</div>';
+    document.querySelector(".back").onclick = function(){ state.screen="home"; render(); };
+    document.getElementById("btn-notice-done").onclick = function(){ state.screen="home"; render(); };
+  }
+
   function renderHome(){
     app.innerHTML =
       '<div class="hero">' +
@@ -1281,7 +1342,8 @@
         '<div class="hero-credit">Par Bad Company Airsoft · Since 2024</div>' +
       '</div>' +
       '<div class="stack">' +
-        '<div class="eyebrow">Avant de commencer</div>' +
+        '<button class="btn btn-ghost" id="btn-notice" style="border-color:var(--amber);color:var(--amber);">📖 C\u2019est quoi cette appli ? (lis ça d\u2019abord)</button>' +
+        '<div class="eyebrow" style="margin-top:10px;">Avant de commencer</div>' +
         '<button class="btn btn-ghost" id="btn-perms">Activer localisation &amp; caméra</button>' +
         '<div id="perm-status"></div>' +
         '<div class="eyebrow" style="margin-top:8px;">Organisateur</div>' +
@@ -1299,6 +1361,7 @@
       '<footer><p class="mono">PROTOTYPE — nécessite une connexion internet sur le terrain</p></footer>';
 
     document.getElementById("btn-perms").onclick = function(){ requestAllPermissions("perm-status"); };
+    document.getElementById("btn-notice").onclick = function(){ state.screen="notice"; render(); };
     document.getElementById("btn-create").onclick = function(){ state.screen="create"; render(); };
     document.getElementById("btn-join").onclick = function(){ state.screen="join"; render(); };
     document.getElementById("btn-library").onclick = function(){ state.screen="library"; render(); };
