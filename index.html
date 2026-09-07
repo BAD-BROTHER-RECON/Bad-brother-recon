@@ -162,7 +162,7 @@
     background:rgba(28,33,22,0.88); border:1px solid var(--line); color:var(--ink); font-size:17px; padding:0;
   }
   .map-rotate-wrapper.fullscreen .map-fullscreen-btn{ top:calc(env(safe-area-inset-top, 0px) + 10px); }
-  .map-recenter-btn, .map-follow-btn, .map-loupe-btn{
+  .map-recenter-btn, .map-follow-btn, .map-loupe-btn, .map-layer-btn{
     position:absolute; right:8px; z-index:410;
     width:38px; height:38px; border-radius:50%; display:flex; align-items:center; justify-content:center;
     background:rgba(28,33,22,0.88); border:1px solid var(--line); color:var(--ink); font-size:16px; padding:0;
@@ -172,9 +172,11 @@
   .map-follow-btn.active{ background:var(--amber); border-color:var(--amber); color:#191a10; }
   .map-loupe-btn{ top:146px; }
   .map-loupe-btn.active{ background:var(--amber); border-color:var(--amber); color:#191a10; }
+  .map-layer-btn{ top:192px; }
   .map-rotate-wrapper.fullscreen .map-recenter-btn{ top:calc(env(safe-area-inset-top, 0px) + 56px); }
   .map-rotate-wrapper.fullscreen .map-follow-btn{ top:calc(env(safe-area-inset-top, 0px) + 102px); }
   .map-rotate-wrapper.fullscreen .map-loupe-btn{ top:calc(env(safe-area-inset-top, 0px) + 148px); }
+  .map-rotate-wrapper.fullscreen .map-layer-btn{ top:calc(env(safe-area-inset-top, 0px) + 194px); }
   .loupe-panel{
     position:absolute; left:10px; bottom:10px; z-index:415;
     width:130px; height:130px; border-radius:50%; overflow:hidden;
@@ -421,6 +423,7 @@
     compassAngle: 0,
     rotationLocked: false,
     wakeLock: null,
+    mapLayerKind: (function(){ try{ return localStorage.getItem("badRecon_mapLayer") || "street"; }catch(e){ return "street"; } })(),
     mapFullscreen: false,
     followMe: false,
     loupeLive: null,
@@ -567,9 +570,22 @@
   // Best effort : sans "Cache API" (vieux navigateur), on retombe simplement sur le
   // chargement réseau classique de Leaflet, sans rien casser.
   var TILE_CACHE_NAME = "badrecon-tiles-v1";
-  function createCachedTileLayer(){
-    var url = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
-    var opts = { maxZoom: 19, attribution: '&copy; OpenStreetMap', subdomains: 'abc' };
+  var TILE_CACHE_NAME_SAT = "badrecon-tiles-sat-v1";
+  var TILE_LAYERS = {
+    street: {
+      url: 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+      opts: { maxZoom: 19, attribution: '&copy; OpenStreetMap', subdomains: 'abc' },
+      cache: TILE_CACHE_NAME
+    },
+    satellite: {
+      url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+      opts: { maxZoom: 19, attribution: '&copy; Esri' },
+      cache: TILE_CACHE_NAME_SAT
+    }
+  };
+  function createCachedTileLayer(kind){
+    var def = TILE_LAYERS[kind] || TILE_LAYERS.street;
+    var url = def.url, opts = def.opts, cacheName = def.cache;
     if(!('caches' in window)) return L.tileLayer(url, opts);
 
     var CachedLayer = L.TileLayer.extend({
@@ -577,7 +593,7 @@
         var img = document.createElement('img');
         img.setAttribute('role', 'presentation');
         var tileUrl = this.getTileUrl(coords);
-        caches.open(TILE_CACHE_NAME).then(function(cache){
+        caches.open(cacheName).then(function(cache){
           cache.match(tileUrl).then(function(cached){
             if(cached){
               cached.blob().then(function(blob){ img.src = URL.createObjectURL(blob); });
@@ -604,6 +620,25 @@
     return new CachedLayer(url, opts);
   }
 
+  // ---------- Bascule vue rue / vue satellite ----------
+  // Préférence locale au téléphone (persistée), applicable à tout moment sur la carte en
+  // direct, l'éditeur et la loupe — pas besoin de choisir une fois pour toutes.
+  function toggleMapLayer(btn){
+    state.mapLayerKind = (state.mapLayerKind === "satellite") ? "street" : "satellite";
+    try{ localStorage.setItem("badRecon_mapLayer", state.mapLayerKind); }catch(e){}
+    if(state.map && state.liveTileLayer){
+      state.map.removeLayer(state.liveTileLayer);
+      state.liveTileLayer = createCachedTileLayer(state.mapLayerKind).addTo(state.map);
+    }
+    if(state.editorMap && state.editorTileLayer){
+      state.editorMap.removeLayer(state.editorTileLayer);
+      state.editorTileLayer = createCachedTileLayer(state.mapLayerKind).addTo(state.editorMap);
+    }
+    if(state.loupeLive) state.loupeLive.setLayer(state.mapLayerKind);
+    if(state.loupeEditor) state.loupeEditor.setLayer(state.mapLayerKind);
+    if(btn) btn.textContent = (state.mapLayerKind === "satellite") ? "🗺️" : "🛰️";
+  }
+
   // ---------- Loupe (aide à la précision, carte en direct ET éditeur) ----------
   // Petite carte secondaire zoomée davantage, qui suit le centre de la carte principale —
   // pratique quand plusieurs marqueurs/points sont proches, ou pour tracer précisément.
@@ -618,7 +653,7 @@
       zoomControl:false, attributionControl:false, dragging:false, scrollWheelZoom:false,
       doubleClickZoom:false, touchZoom:false, boxZoom:false, keyboard:false, tap:false
     }).setView(mainMap.getCenter(), Math.min(19, mainMap.getZoom()+3));
-    createCachedTileLayer().addTo(loupeMap);
+    var loupeTileLayer = createCachedTileLayer(state.mapLayerKind).addTo(loupeMap);
     var zoneLayers = [];
     var meMarker = null;
     var redrawZones = function(){
@@ -654,6 +689,10 @@
     sync();
     var meTimer = setInterval(updateMePosition, 2000);
     return {
+      setLayer: function(kind){
+        loupeMap.removeLayer(loupeTileLayer);
+        loupeTileLayer = createCachedTileLayer(kind).addTo(loupeMap);
+      },
       destroy: function(){
         clearInterval(meTimer);
         mainMap.off('move zoom', sync);
@@ -754,7 +793,9 @@
     { kind:"contact",  emoji:"\ud83d\udea8", label:"Contact" },
     { kind:"ennemi",   emoji:"\ud83d\udc41", label:"Ennemi aper\u00e7u" },
     { kind:"bombe",    emoji:"\ud83d\udca3", label:"Bombe trouv\u00e9e/pos\u00e9e" },
-    { kind:"blesse",   emoji:"\ud83e\ude78", label:"Bless\u00e9" }
+    { kind:"blesse",   emoji:"\ud83e\ude78", label:"Bless\u00e9" },
+    { kind:"destination", emoji:"\ud83c\udfc1", label:"Je me dirige ici" },
+    { kind:"rassemblement", emoji:"\ud83e\uddd1\u200d\ud83e\uddd1\u200d\ud83e\uddd2\u200d\ud83e\uddd2", label:"Rassemblement" }
   ];
   function eventPingsKey(code){ return "event:" + code + ":pings"; }
   function eventScoreKey(code){ return "event:" + code + ":score"; }
@@ -1304,7 +1345,7 @@
         '<p><b>Chat équipe</b> privé, même le staff n\u2019y met pas le nez (promis, juré, craché, main sur le cœur) — et <b>Chat Global</b> pour insulter affectueusement l\u2019équipe adverse entre deux manches, façon trash talk de cour de récré mais avec des adultes qui ont un travail le lundi.</p>' +
         '<p>Message vocal si t\u2019as la flemme de taper en courant comme un dératé poursuivi par ses propres choix de vie.</p>' +
         '<p><b>Pings 📍</b> : balance un repère tactique (ennemi repéré, objectif, gaz, mec blessé qui gémit dramatiquement) visible que par ton équipe. Discrétion garantie, contrairement à Kevin qui gueule "JE LE VOIS" à 40 décibels.</p>' +
-        '<p><b>🆘 SOS</b> : un tap, et ça vibre + ça bipe chez toute ton équipe (et chez le staff, qui voit toujours tout, tel un dieu grec un peu blasé). Impossible à louper, même pour le mec qui a le son coupé, le téléphone dans la poche, ET les écouteurs vissés à fond. L\u2019équipe adverse, elle, n\u2019en sait strictement rien — logique, ils ne te voient déjà pas sur leur carte, encore moins ton drame intérieur.</p>' +
+        '<p><b>🆘 SOS</b> : un tap, et ça vibre + ça bipe chez toute ton équipe (et chez le staff, qui voit toujours tout, tel un dieu grec un peu blasé), avec une vraie notification système si tu as autorisé les alertes — pas juste un bruit dans l\u2019appli qu\u2019il faut avoir sous les yeux au bon moment. Seule limite honnête : téléphone en veille profonde depuis un bon moment, on ne peut pas garantir à 100% (ça demanderait un vrai serveur d\u2019alerte, pas juste un site). L\u2019équipe adverse, elle, n\u2019en sait strictement rien — logique, ils ne te voient déjà pas sur leur carte, encore moins ton drame intérieur.</p>' +
         '<p><b>Journal</b> : l\u2019historique complet, capture par capture, élimination par élimination — l\u2019arbitre impartial qui règle les débats de comptoir d\u2019après-partie, du style "NON C\u2019EST MOI QUI T\u2019AI EU EN PREMIER".</p>' +
 
         '<div class="eyebrow" style="margin-top:16px;">🎮 Les modes de jeu — choisis ton chaos</div>' +
@@ -1375,7 +1416,7 @@
   async function requestAllPermissions(elId){
     var el = document.getElementById(elId);
     if(el) el.innerHTML = '<div class="banner info">Demande des autorisations…</div>';
-    var results = { geo: false, cam: false };
+    var results = { geo: false, cam: false, notif: false };
 
     try{
       await new Promise(function(resolve, reject){
@@ -1394,16 +1435,51 @@
       results.cam = true;
     }catch(e){ results.cam = false; }
 
+    try{
+      if("Notification" in window){
+        var perm = await Notification.requestPermission();
+        results.notif = (perm === "granted");
+        if(results.notif) registerSosServiceWorker();
+      }
+    }catch(e){ results.notif = false; }
+
     if(el){
       var needsHelp = !results.geo || !results.cam;
       el.innerHTML =
         '<div class="banner '+(needsHelp?'warn':'info')+'">' +
           '<div>'+(results.geo?'✅':'❌')+' Position '+(results.geo?'autorisée':'refusée ou indisponible')+'</div>' +
           '<div style="margin-top:4px;">'+(results.cam?'✅':'❌')+' Caméra '+(results.cam?'autorisée':'refusée ou indisponible')+'</div>' +
+          '<div style="margin-top:4px;">'+(results.notif?'✅':'❌')+' Alertes SOS '+(results.notif?'autorisées':'refusées ou indisponibles')+'</div>' +
           (needsHelp ? '<p style="margin-top:8px;">Si un accès reste refusé, l\u2019appli ne peut pas le redemander toute seule : touche l\u2019icône 🔒 (ou "i") à côté de l\u2019adresse du site, autorise Position et/ou Caméra, puis recharge la page. Et si tu es dans l\u2019aperçu intégré à l\u2019app Claude, ouvre plutôt le lien publié dans Safari/Chrome.</p>' : '') +
         '</div>';
     }
     return results;
+  }
+
+  // ---------- Alertes SOS via notification système (service worker) ----------
+  // Limite honnête : ceci fonctionne tant que le navigateur n'a pas complètement suspendu
+  // l'onglet (écran verrouillé récemment, appli en arrière-plan) — pas de garantie si le
+  // téléphone est en veille profonde depuis longtemps ou le navigateur totalement fermé.
+  // Une fiabilité à 100% demanderait un vrai serveur de notifications push, hors de portée
+  // d'un site statique GitHub Pages sans backend.
+  var sosSwRegistration = null;
+  function registerSosServiceWorker(){
+    if(!("serviceWorker" in navigator)) return;
+    navigator.serviceWorker.register("sw.js").then(function(reg){
+      sosSwRegistration = reg;
+    }).catch(function(e){ /* pas de sw.js déployé, ou navigateur qui refuse — on continue sans */ });
+  }
+  function showSosNotification(name, team){
+    if(!sosSwRegistration || Notification.permission !== "granted") return;
+    try{
+      sosSwRegistration.showNotification("🆘 SOS — " + (name||"Un coéquipier"), {
+        body: (team ? ("Équipe " + team + " — ") : "") + "besoin d\u2019aide, regarde la carte.",
+        vibrate: [200,100,200,100,200],
+        tag: "bad-recon-sos",
+        renotify: true,
+        requireInteraction: true
+      });
+    }catch(e){}
   }
 
   function renderCreate(){
@@ -1860,7 +1936,7 @@
     }
 
     var map = L.map('editor-map', { zoomControl: true }).setView([center.lat, center.lng], 17);
-    createCachedTileLayer().addTo(map);
+    state.editorTileLayer = createCachedTileLayer(state.mapLayerKind).addTo(map);
     state.editorMap = map;
     state.editorLayers = {};
     startEditorGeoWatch();
@@ -1907,6 +1983,19 @@
       }
       if(state.warzoneCreationMode === "gas"){
         confirmGasZone([e.latlng.lat, e.latlng.lng]);
+        return;
+      }
+      if(state.placingEmojiForZone){
+        var targetZone = state.editorZones.find(function(z){ return z.id === state.placingEmojiForZone.zoneId; });
+        if(targetZone){
+          if(!targetZone.emojiMarkers) targetZone.emojiMarkers = [];
+          targetZone.emojiMarkers.push({ id: genId("em"), emoji: state.placingEmojiForZone.emoji, lat: e.latlng.lat, lng: e.latlng.lng });
+          drawExistingZones(); drawZoneList();
+          persistEditorZones();
+        }
+        state.placingEmojiForZone = null;
+        var bannerEl = document.getElementById("editor-banner");
+        if(bannerEl) bannerEl.innerHTML = "";
         return;
       }
       if(state.placingPoint){
@@ -2211,21 +2300,38 @@
         .addTo(map).bindTooltip(gasLabel);
     } else {
       var info = zoneStatusInfo(z.status);
-      layer = L.polygon(z.points, {
+      var polyLayer = L.polygon(z.points, {
         color: info.color, weight:2, fillColor: info.color, fillOpacity:0.28,
         className: z.status === 'objectif' ? 'zone-objectif' : ''
-      }).addTo(map).bindTooltip(escapeHtml(z.name) + ' · ' + info.label);
+      }).bindTooltip(escapeHtml(z.name) + ' · ' + info.label);
       // Toujours attaché (pas seulement si notes/photo existaient à la création du calque) :
       // sinon un bâtiment sans notes au départ ne pourrait plus jamais en afficher, même
       // après que l'organisateur en ait ajouté depuis l'éditeur.
-      layer.on('click', function(){
+      polyLayer.on('click', function(){
         var current = (state.cachedZones||[]).find(function(zz){ return zz.id === z.id; }) || z;
         if(current.notes || current.photo){
-          layer.bindPopup(escapeHtml(current.name) + zoneInfoPopupHtml(current), { maxWidth: 170 }).openPopup();
+          polyLayer.bindPopup(escapeHtml(current.name) + zoneInfoPopupHtml(current), { maxWidth: 170 }).openPopup();
         }
       });
+      // Icônes d'aide à la reconnaissance (ex. 🏥 pour un hôpital) : visibles directement
+      // sur la carte, sans avoir à toucher le bâtiment pour ouvrir sa fiche.
+      if(z.emojiMarkers && z.emojiMarkers.length){
+        var emojiLayers = z.emojiMarkers.map(function(em){
+          return L.marker([em.lat, em.lng], { icon: emojiMarkerIcon(em.emoji), interactive:false });
+        });
+        layer = L.layerGroup([polyLayer].concat(emojiLayers)).addTo(map);
+      } else {
+        layer = polyLayer.addTo(map);
+      }
     }
     return layer;
+  }
+
+  function emojiMarkerIcon(emoji){
+    return L.divIcon({
+      html: '<div style="font-size:20px;line-height:1;filter:drop-shadow(0 1px 2px rgba(0,0,0,.85));">'+emoji+'</div>',
+      className: "", iconSize:[24,24], iconAnchor:[12,12]
+    });
   }
 
   function vertexHandleIcon(){
@@ -2293,6 +2399,7 @@
 
     if(isEditingThis){
       renderSegmentLabels(map, z.points, !useLine);
+      var handles = [];
       z.points.forEach(function(pt, idx){
         var handle = L.marker(pt, { icon: vertexHandleIcon(), draggable: true }).addTo(map);
         handle.on('drag', function(e){
@@ -2302,7 +2409,40 @@
           renderSegmentLabels(map, z.points, !useLine);
         });
         handle.on('dragend', async function(){ await persistEditorZones(); });
+        handles.push(handle);
         layers.push(handle);
+      });
+
+      // Déplacer TOUTE la forme d'un coup en faisant glisser son intérieur (pas une
+      // poignée précise) — Leaflet ne sait pas nativement faire glisser un polygone entier,
+      // on le fait donc à la main : on suit le doigt et on translate tous les sommets par
+      // le même écart, poignées comprises pour qu'elles restent visuellement synchronisées.
+      // Les écouteurs mousemove/mouseup ne sont attachés QUE pendant le geste actif (posés
+      // au mousedown, retirés au mouseup) — sinon, comme cette fonction est rappelée à
+      // chaque redessin, ils s'empileraient sans jamais être nettoyés.
+      poly.on('mousedown', function(e){
+        L.DomEvent.stopPropagation(e);
+        map.dragging.disable();
+        var moveStart = e.latlng;
+        var moveOrigPoints = z.points.map(function(p){ return p.slice(); });
+        function onShapeMove(ev){
+          var dLat = ev.latlng.lat - moveStart.lat;
+          var dLng = ev.latlng.lng - moveStart.lng;
+          z.points = moveOrigPoints.map(function(p){ return [p[0]+dLat, p[1]+dLng]; });
+          poly.setLatLngs(z.points);
+          handles.forEach(function(h, idx){ h.setLatLng(z.points[idx]); });
+          renderSegmentLabels(map, z.points, !useLine);
+        }
+        function onShapeMoveEnd(){
+          map.off('mousemove', onShapeMove);
+          map.off('mouseup', onShapeMoveEnd);
+          map.off('mouseout', onShapeMoveEnd);
+          map.dragging.enable();
+          persistEditorZones();
+        }
+        map.on('mousemove', onShapeMove);
+        map.on('mouseup', onShapeMoveEnd);
+        map.on('mouseout', onShapeMoveEnd);
       });
     }
 
@@ -2398,6 +2538,12 @@
           '<button class="btn btn-sm btn-ghost" id="btn-start-draw">+ Bâtiment</button>' +
           '<button class="btn btn-sm btn-ghost" id="btn-start-point">+ Point</button>' +
         '</div>' +
+        '<p class="mono" style="font-size:10px;color:var(--ink-dim);text-transform:uppercase;margin-top:8px;">Forme rapide (centrée sur la vue)</p>' +
+        '<div class="row" style="margin-top:4px;flex-wrap:wrap;">' +
+          '<button class="btn btn-sm btn-ghost" id="btn-preset-square">▭ Carré</button>' +
+          '<button class="btn btn-sm btn-ghost" id="btn-preset-rect">▬ Rectangle</button>' +
+          '<button class="btn btn-sm btn-ghost" id="btn-preset-circle">⬤ Cercle</button>' +
+        '</div>' +
         '<div class="row" style="margin-top:6px;">' +
           '<button class="btn btn-sm btn-ghost" id="btn-start-wall">🧱 Mur</button>' +
           '<button class="btn btn-sm btn-ghost" id="btn-start-halfwall">⬜ Demi-mur</button>' +
@@ -2409,6 +2555,9 @@
       document.getElementById("btn-start-terrain").onclick = function(){ state.editingZoneId = null; state.drawing = true; state.drawKind = "terrain"; state.drawPoints = []; state.drawPointsRedo = []; drawExistingZones(); drawToolbar(); };
       document.getElementById("btn-start-draw").onclick = function(){ state.editingZoneId = null; state.drawing = true; state.drawKind = "building"; state.drawPoints = []; state.drawPointsRedo = []; drawExistingZones(); drawToolbar(); };
       document.getElementById("btn-start-point").onclick = function(){ state.editingZoneId = null; state.placingPoint = true; drawExistingZones(); drawToolbar(); };
+      document.getElementById("btn-preset-square").onclick = function(){ addPresetShape("carre"); };
+      document.getElementById("btn-preset-rect").onclick = function(){ addPresetShape("rectangle"); };
+      document.getElementById("btn-preset-circle").onclick = function(){ addPresetShape("cercle"); };
       document.getElementById("btn-start-wall").onclick = function(){ state.editingZoneId = null; state.drawing = true; state.drawKind = "mur"; state.drawPoints = []; state.drawPointsRedo = []; drawExistingZones(); drawToolbar(); };
       document.getElementById("btn-start-halfwall").onclick = function(){ state.editingZoneId = null; state.drawing = true; state.drawKind = "demimur"; state.drawPoints = []; state.drawPointsRedo = []; drawExistingZones(); drawToolbar(); };
       document.getElementById("btn-start-warzone").onclick = function(){ state.editingZoneId = null; showWarzoneCreationChoice(); };
@@ -2616,6 +2765,38 @@
     };
   }
 
+  // ---------- Formes prédéfinies (bâtiment carré/rectangle/cercle en un tap) ----------
+  // Centrée sur la vue actuelle de l'éditeur, avec une taille de départ raisonnable —
+  // ensuite à ajuster en faisant glisser les poignées, comme n'importe quel bâtiment dessiné
+  // à la main. La correction cos(latitude) évite qu'un cercle paraisse ovale selon l'endroit
+  // du globe où se trouve le terrain.
+  async function addPresetShape(shapeKind){
+    var mapCenter = state.editorMap ? state.editorMap.getCenter() : state.editorCenter;
+    if(!mapCenter) return;
+    var lat = mapCenter.lat, lng = mapCenter.lng;
+    var mPerDegLat = 111320;
+    var mPerDegLng = 111320 * Math.cos(lat * Math.PI/180);
+    function offset(dLat, dLng){ return [lat + dLat/mPerDegLat, lng + dLng/mPerDegLng]; }
+    var points;
+    if(shapeKind === "carre"){
+      points = [offset(-8,-8), offset(-8,8), offset(8,8), offset(8,-8)];
+    } else if(shapeKind === "rectangle"){
+      points = [offset(-6,-12), offset(-6,12), offset(6,12), offset(6,-12)];
+    } else {
+      points = [];
+      var steps = 16, r = 8;
+      for(var i=0; i<steps; i++){
+        var ang = (i/steps) * 2 * Math.PI;
+        points.push(offset(r*Math.sin(ang), r*Math.cos(ang)));
+      }
+    }
+    var buildingCount = state.editorZones.filter(function(z){ return z.kind === "building"; }).length;
+    state.editorZones.push({ id: genId("z"), kind: "building", name: "Bâtiment " + (buildingCount+1), points: points, status: "intact" });
+    drawExistingZones();
+    drawZoneList();
+    await persistEditorZones();
+  }
+
   function finishDrawing(){
     var isWallKind = state.drawKind === "mur" || state.drawKind === "demimur";
     var minPts = isWallKind ? 2 : 3;
@@ -2793,6 +2974,7 @@
         ZONE_STATUSES.map(function(s){ return '<option value="'+s.key+'"'+(s.key===z.status?' selected':'')+'>'+s.label+'</option>'; }).join("") +
       '</select>' +
       '<button class="btn btn-sm btn-ghost zone-info-toggle" data-id="'+z.id+'" title="Détails">ℹ️</button>' +
+      '<button class="btn btn-sm btn-ghost zone-dup" data-id="'+z.id+'" title="Dupliquer">⧉</button>' +
       '<button class="remove-chip zone-del" data-id="'+z.id+'">✕</button>' +
     '</div>' + (state.editingInfoZoneId === z.id ? renderZoneInfoPanel(z) : '');
   }
@@ -2812,6 +2994,21 @@
         '<button class="btn btn-sm btn-ghost zone-info-photo-gallery-btn" data-id="'+z.id+'">🖼️ Galerie</button>' +
         (z.photo ? '<button class="btn btn-sm btn-ghost zone-info-photo-remove" data-id="'+z.id+'">Retirer la photo</button>' : '') +
       '</div>' +
+      (z.kind !== "point" ? (
+        '<div class="field"><label>Icônes sur le bâtiment (aide à repérer d\u2019un coup d\u2019œil)</label>' +
+          '<div class="row" style="flex-wrap:wrap;margin-bottom:6px;">' +
+            (z.emojiMarkers||[]).map(function(em){
+              return '<span class="team-chip">'+em.emoji+'<button class="remove-chip zone-emoji-remove" data-zone="'+z.id+'" data-em="'+em.id+'">✕</button></span>';
+            }).join("") +
+            (!(z.emojiMarkers && z.emojiMarkers.length) ? '<span style="font-size:11px;color:var(--ink-dim);">Aucune pour l\u2019instant.</span>' : '') +
+          '</div>' +
+          '<div class="row">' +
+            '<input type="text" class="zone-emoji-input" data-id="'+z.id+'" placeholder="🏥" maxlength="8" style="width:64px;flex:none;text-align:center;" />' +
+            '<button class="btn btn-sm btn-ghost zone-emoji-place" data-id="'+z.id+'">Placer sur la carte</button>' +
+          '</div>' +
+          '<p style="font-size:11px;color:var(--ink-dim);margin-top:4px;">Tape un emoji avec le clavier de ton téléphone, touche "Placer", puis touche l\u2019endroit exact sur le bâtiment. Répète pour en ajouter plusieurs.</p>' +
+        '</div>'
+      ) : '') +
       '<div class="row" style="margin-top:8px;">' +
         '<button class="btn btn-sm btn-primary zone-info-save" data-id="'+z.id+'">Enregistrer</button>' +
         '<button class="btn btn-sm btn-ghost zone-info-close" data-id="'+z.id+'">Fermer</button>' +
@@ -2926,6 +3123,26 @@
         if(z){ z.photo = null; drawZoneList(); }
       };
     });
+    Array.prototype.forEach.call(wrap.querySelectorAll(".zone-emoji-remove"), function(btn){
+      btn.onclick = async function(){
+        var z = state.editorZones.find(function(z){ return z.id === btn.dataset.zone; });
+        if(z && z.emojiMarkers){
+          z.emojiMarkers = z.emojiMarkers.filter(function(em){ return em.id !== btn.dataset.em; });
+          drawExistingZones(); drawZoneList();
+          await persistEditorZones();
+        }
+      };
+    });
+    Array.prototype.forEach.call(wrap.querySelectorAll(".zone-emoji-place"), function(btn){
+      btn.onclick = function(){
+        var input = wrap.querySelector('.zone-emoji-input[data-id="'+btn.dataset.id+'"]');
+        var emoji = input ? input.value.trim() : "";
+        if(!emoji) return;
+        state.placingEmojiForZone = { zoneId: btn.dataset.id, emoji: emoji };
+        var hint = document.getElementById("editor-banner");
+        if(hint) hint.innerHTML = '<div class="banner info">Touche l\u2019endroit exact sur le bâtiment pour placer '+emoji+'.</div>';
+      };
+    });
     Array.prototype.forEach.call(wrap.querySelectorAll(".zone-info-save"), function(btn){
       btn.onclick = async function(){
         var z = state.editorZones.find(function(z){ return z.id === btn.dataset.id; });
@@ -2976,6 +3193,29 @@
       btn.onclick = async function(){
         state.editorZones = state.editorZones.filter(function(z){ return z.id !== btn.dataset.id; });
         if(state.editingZoneId === btn.dataset.id) state.editingZoneId = null;
+        drawExistingZones(); drawZoneList();
+        await persistEditorZones();
+      };
+    });
+    Array.prototype.forEach.call(wrap.querySelectorAll(".zone-dup"), function(btn){
+      btn.onclick = async function(){
+        var original = state.editorZones.find(function(z){ return z.id === btn.dataset.id; });
+        if(!original) return;
+        // Léger décalage (~13 m) pour que la copie soit visible et distincte de l'originale,
+        // à faire glisser ensuite à sa vraie place plutôt que superposée pile dessus.
+        var offset = 0.00012;
+        var copy = JSON.parse(JSON.stringify(original));
+        copy.id = genId("zone");
+        copy.name = (original.name || "Bâtiment") + " (copie)";
+        if(Array.isArray(copy.points)){
+          copy.points = copy.points.map(function(p){ return [p[0] + offset, p[1] + offset]; });
+        }
+        // Une copie ne doit hériter d'aucun état de partie en cours (statut, capture...).
+        copy.status = "intact";
+        copy.notes = original.notes || "";
+        copy.photo = null;
+        copy.emojiMarkers = [];
+        state.editorZones.push(copy);
         drawExistingZones(); drawZoneList();
         await persistEditorZones();
       };
@@ -4467,7 +4707,7 @@
     app.innerHTML =
       '<div class="topbar"><button class="back">‹ Quitter</button><div class="eyebrow">'+escapeHtml(cfg.name)+' · '+cfg.code+'</div><button class="btn btn-ghost btn-sm" id="btn-notif-bell" style="position:relative;">🔔<span id="notif-badge" style="display:none;position:absolute;top:-6px;right:-6px;background:var(--danger);color:#fff;border-radius:50%;min-width:16px;height:16px;font-size:10px;line-height:16px;text-align:center;padding:0 3px;"></span></button></div>' +
       '<div id="notif-dropdown" style="display:none;"></div>' +
-      '<div class="map-rotate-wrapper" id="map-wrapper"><div id="map"></div><button class="map-fullscreen-btn" id="btn-fullscreen-map" title="Plein écran">⛶</button><button class="map-recenter-btn" id="btn-recenter-map" title="Recentrer sur moi">📍</button><button class="map-follow-btn" id="btn-follow-map" title="Suivre ma position">🧭</button><button class="map-loupe-btn" id="btn-loupe-map" title="Loupe">🔍</button><div class="loupe-panel" id="loupe-panel-live"></div><div class="warzone-banner-overlay"><div id="scenario-banner"></div><div id="limits-banner"></div><div id="timers-banner"></div><div id="warzone-banner"></div><div id="gas-banner"></div><div id="fog-banner"></div><div id="radar-bonus-banner"></div><div id="flag-banner"></div><div id="scoreboard"></div><div id="lives-board"></div></div></div>' +
+      '<div class="map-rotate-wrapper" id="map-wrapper"><div id="map"></div><button class="map-fullscreen-btn" id="btn-fullscreen-map" title="Plein écran">⛶</button><button class="map-recenter-btn" id="btn-recenter-map" title="Recentrer sur moi">📍</button><button class="map-follow-btn" id="btn-follow-map" title="Suivre ma position">🧭</button><button class="map-loupe-btn" id="btn-loupe-map" title="Loupe">🔍</button><button class="map-layer-btn" id="btn-layer-map" title="Vue satellite">'+(state.mapLayerKind==="satellite"?'🗺️':'🛰️')+'</button><div class="loupe-panel" id="loupe-panel-live"></div><div class="warzone-banner-overlay"><div id="scenario-banner"></div><div id="limits-banner"></div><div id="timers-banner"></div><div id="warzone-banner"></div><div id="gas-banner"></div><div id="fog-banner"></div><div id="radar-bonus-banner"></div><div id="flag-banner"></div><div id="scoreboard"></div><div id="lives-board"></div></div></div>' +
       '<div class="status-bar"><span class="status-dot" id="status-dot"></span><span id="status-text">Initialisation…</span></div>' +
       '<p id="zone-danger-note" class="mono" style="font-size:11px;color:#f2a89a;margin-top:4px;"></p>' +
       '<p id="offline-indicator" class="mono" style="font-size:11px;color:var(--amber);margin-top:4px;display:none;"></p>' +
@@ -4563,6 +4803,9 @@
         }, 50); // laisse le panneau devenir visible avant d'y créer la carte Leaflet
       }
     };
+    document.getElementById("btn-layer-map").onclick = function(){
+      toggleMapLayer(document.getElementById("btn-layer-map"));
+    };
     document.getElementById("btn-notif-bell").onclick = function(){
       var el = document.getElementById("notif-dropdown");
       if(el.style.display === "none"){ el.style.display = "block"; renderNotifDropdown(); }
@@ -4641,7 +4884,7 @@
     }
 
     var map = L.map('map', { zoomControl: true }).setView([cfg.center.lat, cfg.center.lng], cfg.zoom || 17);
-    createCachedTileLayer().addTo(map);
+    state.liveTileLayer = createCachedTileLayer(state.mapLayerKind).addTo(map);
     state.map = map;
     map.on('zoomend', applyLabelZoomVisibility);
     map.on('zoomend moveend', updateMarkerClusters);
@@ -4686,6 +4929,7 @@
     refreshPings();
     startWarzoneTicker();
     requestWakeLock();
+    if("Notification" in window && Notification.permission === "granted") registerSosServiceWorker();
   }
 
   // ---------- Rafraîchissement adapté à la batterie ----------
@@ -5198,9 +5442,68 @@
     if(note) note.textContent = restricted ? "Vision limitée à ton équipe (sauf déblocage par le staff)." : "";
 
     checkForNewSos(visible);
+    updateGhostTracking(visible);
+    updateGhostMarkers();
     updateMarkers(visible);
     updateRoster(visible);
     updateLivesBoard(players);
+  }
+
+  // ---------- Dernière position connue (discrète) après une révélation d'équipe ----------
+  // Quand le staff révèle temporairement une équipe adverse puis la recache, on garde un
+  // repère très discret de sa dernière position vue pendant quelques minutes, plutôt qu'elle
+  // disparaisse instantanément — sans jamais réafficher son nom ni la suivre en temps réel.
+  var GHOST_TTL_MS = 5 * 60000;
+  function updateGhostTracking(visible){
+    var now = Date.now();
+    if(!state.ghostPlayers) state.ghostPlayers = {};
+    if(!state.prevVisibleIds) state.prevVisibleIds = {};
+    var currentVisibleIds = {};
+    Object.keys(visible).forEach(function(pid){ currentVisibleIds[pid] = true; });
+
+    Object.keys(state.prevVisibleIds).forEach(function(pid){
+      if(pid === state.playerId) return; // jamais de fantôme pour soi-même
+      if(!currentVisibleIds[pid] && state.prevVisiblePositions && state.prevVisiblePositions[pid]){
+        state.ghostPlayers[pid] = Object.assign({}, state.prevVisiblePositions[pid], { ts: now });
+      }
+    });
+    // Redevenu visible : le fantôme n'a plus lieu d'être, on a une vraie position à jour.
+    Object.keys(currentVisibleIds).forEach(function(pid){ delete state.ghostPlayers[pid]; });
+    Object.keys(state.ghostPlayers).forEach(function(pid){
+      if(now - state.ghostPlayers[pid].ts > GHOST_TTL_MS) delete state.ghostPlayers[pid];
+    });
+
+    state.prevVisiblePositions = {};
+    Object.keys(visible).forEach(function(pid){
+      var p = visible[pid];
+      if(p && p.lat != null && p.lng != null){
+        state.prevVisiblePositions[pid] = { lat:p.lat, lng:p.lng, team:p.team };
+      }
+    });
+    state.prevVisibleIds = currentVisibleIds;
+  }
+  function updateGhostMarkers(){
+    if(!state.map) return;
+    if(!state.ghostMarkerLayers) state.ghostMarkerLayers = {};
+    var currentIds = Object.keys(state.ghostPlayers || {});
+    Object.keys(state.ghostMarkerLayers).forEach(function(pid){
+      if(currentIds.indexOf(pid) === -1){
+        state.map.removeLayer(state.ghostMarkerLayers[pid]);
+        delete state.ghostMarkerLayers[pid];
+      }
+    });
+    currentIds.forEach(function(pid){
+      var g = state.ghostPlayers[pid];
+      var col = teamColor(state.event || {}, g.team);
+      if(!state.ghostMarkerLayers[pid]){
+        // Petit, semi-transparent, pointillé, sans nom : un repère discret, pas un doublon
+        // du marqueur en direct.
+        state.ghostMarkerLayers[pid] = L.circleMarker([g.lat, g.lng], {
+          radius: 6, color: col, weight: 1.5, fillColor: col, fillOpacity: 0.3, opacity: 0.5,
+          dashArray: "3,3"
+        }).addTo(state.map);
+      }
+    });
   }
 
   // ---------- Alerte (son + vibration) quand un SOS apparaît ----------
@@ -5210,15 +5513,19 @@
     if(!state.knownSosIds) state.knownSosIds = {};
     var currentIds = {};
     var newSos = false;
+    var triggerName = null, triggerTeam = null;
     Object.keys(visible).forEach(function(pid){
       var p = visible[pid];
       if(p && p.sos){
         currentIds[pid] = true;
-        if(!state.knownSosIds[pid] && pid !== state.playerId) newSos = true;
+        if(!state.knownSosIds[pid] && pid !== state.playerId){
+          newSos = true;
+          triggerName = p.name; triggerTeam = p.team;
+        }
       }
     });
     state.knownSosIds = currentIds;
-    if(newSos){ vibrateAlert(); playAlertBeep(); }
+    if(newSos){ vibrateAlert(); playAlertBeep(); showSosNotification(triggerName, triggerTeam); }
   }
   function vibrateAlert(){
     try{ if(navigator.vibrate) navigator.vibrate([200,100,200,100,200]); }catch(e){}
@@ -5916,6 +6223,10 @@
     state.pingPlacingKind = null;
     releaseWakeLock();
     state.knownSosIds = null;
+    state.ghostPlayers = null;
+    state.ghostMarkerLayers = null;
+    state.prevVisibleIds = null;
+    state.prevVisiblePositions = null;
   }
 
   // ---------- Écran maintenu actif pendant la partie ----------
