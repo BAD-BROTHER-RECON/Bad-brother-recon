@@ -1907,7 +1907,7 @@
     var center = state.editorCenter;
     app.innerHTML =
       '<div class="topbar"><button class="back">‹ Retour</button><div class="eyebrow">Bâtiments</div></div>' +
-      '<div style="position:relative;"><div id="editor-map"></div><button class="map-loupe-btn" id="btn-loupe-editor" title="Loupe" style="top:8px;">🔍</button><div class="loupe-panel" id="loupe-panel-editor"></div></div>' +
+      '<div style="position:relative;"><div id="editor-map"></div><button class="map-loupe-btn" id="btn-loupe-editor" title="Loupe" style="top:8px;">🔍</button><button class="map-layer-btn" id="btn-layer-editor" title="Vue satellite" style="top:54px;">'+(state.mapLayerKind==="satellite"?'🗺️':'🛰️')+'</button><div class="loupe-panel" id="loupe-panel-editor"></div></div>' +
       '<div class="panel" style="margin-top:8px;">' +
         '<label class="mono" style="font-size:11px;color:var(--ink-dim);text-transform:uppercase;">🖼️ Image de référence (aide au tracé)</label>' +
         '<p style="margin-top:4px;">Superpose un plan existant (PDF exporté en image, photo drone, plan à main levée…) sur la carte pour tracer par-dessus plus précisément. Reste sur ton téléphone, pas envoyée aux autres joueurs.</p>' +
@@ -1957,6 +1957,9 @@
           state.loupeEditor = createLoupe(state.editorMap, "loupe-panel-editor", function(){ return state.editorZones; });
         }, 50);
       }
+    };
+    document.getElementById("btn-layer-editor").onclick = function(){
+      toggleMapLayer(document.getElementById("btn-layer-editor"));
     };
 
     drawExistingZones();
@@ -2340,6 +2343,19 @@
       className: "", iconSize:[14,14], iconAnchor:[7,7]
     });
   }
+  // Poignée distincte (couleur + symbole) pour bien la différencier des poignées de coin —
+  // celle-ci déplace toute la forme, pas juste un sommet.
+  function moveHandleIcon(){
+    return L.divIcon({
+      html: '<div style="width:26px;height:26px;border-radius:50%;background:var(--amber);border:2px solid #14170f;box-shadow:0 1px 4px rgba(0,0,0,.7);display:flex;align-items:center;justify-content:center;font-size:14px;color:#14170f;">✥</div>',
+      className: "", iconSize:[26,26], iconAnchor:[13,13]
+    });
+  }
+  function polygonCentroid(points){
+    var sumLat = 0, sumLng = 0;
+    points.forEach(function(p){ sumLat += p[0]; sumLng += p[1]; });
+    return [sumLat/points.length, sumLng/points.length];
+  }
 
   // Version éditable réservée à l'éditeur : sommets et points déplaçables au doigt,
   // pour corriger la taille/position d'un tracé après coup (jamais utilisée sur la carte en direct des joueurs).
@@ -2413,37 +2429,25 @@
         layers.push(handle);
       });
 
-      // Déplacer TOUTE la forme d'un coup en faisant glisser son intérieur (pas une
-      // poignée précise) — Leaflet ne sait pas nativement faire glisser un polygone entier,
-      // on le fait donc à la main : on suit le doigt et on translate tous les sommets par
-      // le même écart, poignées comprises pour qu'elles restent visuellement synchronisées.
-      // Les écouteurs mousemove/mouseup ne sont attachés QUE pendant le geste actif (posés
-      // au mousedown, retirés au mouseup) — sinon, comme cette fonction est rappelée à
-      // chaque redessin, ils s'empileraient sans jamais être nettoyés.
-      poly.on('mousedown', function(e){
-        L.DomEvent.stopPropagation(e);
-        map.dragging.disable();
-        var moveStart = e.latlng;
-        var moveOrigPoints = z.points.map(function(p){ return p.slice(); });
-        function onShapeMove(ev){
-          var dLat = ev.latlng.lat - moveStart.lat;
-          var dLng = ev.latlng.lng - moveStart.lng;
-          z.points = moveOrigPoints.map(function(p){ return [p[0]+dLat, p[1]+dLng]; });
-          poly.setLatLngs(z.points);
-          handles.forEach(function(h, idx){ h.setLatLng(z.points[idx]); });
-          renderSegmentLabels(map, z.points, !useLine);
-        }
-        function onShapeMoveEnd(){
-          map.off('mousemove', onShapeMove);
-          map.off('mouseup', onShapeMoveEnd);
-          map.off('mouseout', onShapeMoveEnd);
-          map.dragging.enable();
-          persistEditorZones();
-        }
-        map.on('mousemove', onShapeMove);
-        map.on('mouseup', onShapeMoveEnd);
-        map.on('mouseout', onShapeMoveEnd);
+      // Poignée centrale dédiée au déplacement de TOUTE la forme d'un coup, plutôt qu'un
+      // geste de glissement sur le corps du polygone (peu fiable au toucher, et invisible/
+      // pas assez découvrable). Même mécanisme fiable que les poignées de coin ci-dessus
+      // (glisser un marqueur Leaflet), juste avec un aspect distinct pour qu'elle se
+      // remarque comme "celle qui déplace tout".
+      var moveHandle = L.marker(polygonCentroid(z.points), { icon: moveHandleIcon(), draggable: true }).addTo(map);
+      var moveHandleLast = moveHandle.getLatLng();
+      moveHandle.on('drag', function(e){
+        var ll = e.target.getLatLng();
+        var dLat = ll.lat - moveHandleLast.lat;
+        var dLng = ll.lng - moveHandleLast.lng;
+        moveHandleLast = ll;
+        z.points = z.points.map(function(p){ return [p[0]+dLat, p[1]+dLng]; });
+        poly.setLatLngs(z.points);
+        handles.forEach(function(h, idx){ h.setLatLng(z.points[idx]); });
+        renderSegmentLabels(map, z.points, !useLine);
       });
+      moveHandle.on('dragend', async function(){ await persistEditorZones(); });
+      layers.push(moveHandle);
     }
 
     return layers;
@@ -2531,18 +2535,13 @@
     if(!state.drawing){
       var hasTerrain = state.editorZones.some(function(z){ return z.kind === "terrain"; });
       el.innerHTML =
+        (state.editingZoneId ? '<p class="mono" style="font-size:11px;color:var(--amber-dim);margin-bottom:8px;">✥ (gros point ambre) déplace toute la forme · petits points blancs = un seul coin</p>' : '') +
         '<div class="row">' +
           '<button class="btn btn-sm '+(hasTerrain ? 'btn-ghost' : 'btn-primary')+'" id="btn-start-terrain">'+(hasTerrain ? 'Redéfinir la limite' : '+ Limite du terrain')+'</button>' +
         '</div>' +
         '<div class="row" style="margin-top:6px;">' +
           '<button class="btn btn-sm btn-ghost" id="btn-start-draw">+ Bâtiment</button>' +
           '<button class="btn btn-sm btn-ghost" id="btn-start-point">+ Point</button>' +
-        '</div>' +
-        '<p class="mono" style="font-size:10px;color:var(--ink-dim);text-transform:uppercase;margin-top:8px;">Forme rapide (centrée sur la vue)</p>' +
-        '<div class="row" style="margin-top:4px;flex-wrap:wrap;">' +
-          '<button class="btn btn-sm btn-ghost" id="btn-preset-square">▭ Carré</button>' +
-          '<button class="btn btn-sm btn-ghost" id="btn-preset-rect">▬ Rectangle</button>' +
-          '<button class="btn btn-sm btn-ghost" id="btn-preset-circle">⬤ Cercle</button>' +
         '</div>' +
         '<div class="row" style="margin-top:6px;">' +
           '<button class="btn btn-sm btn-ghost" id="btn-start-wall">🧱 Mur</button>' +
@@ -2555,9 +2554,6 @@
       document.getElementById("btn-start-terrain").onclick = function(){ state.editingZoneId = null; state.drawing = true; state.drawKind = "terrain"; state.drawPoints = []; state.drawPointsRedo = []; drawExistingZones(); drawToolbar(); };
       document.getElementById("btn-start-draw").onclick = function(){ state.editingZoneId = null; state.drawing = true; state.drawKind = "building"; state.drawPoints = []; state.drawPointsRedo = []; drawExistingZones(); drawToolbar(); };
       document.getElementById("btn-start-point").onclick = function(){ state.editingZoneId = null; state.placingPoint = true; drawExistingZones(); drawToolbar(); };
-      document.getElementById("btn-preset-square").onclick = function(){ addPresetShape("carre"); };
-      document.getElementById("btn-preset-rect").onclick = function(){ addPresetShape("rectangle"); };
-      document.getElementById("btn-preset-circle").onclick = function(){ addPresetShape("cercle"); };
       document.getElementById("btn-start-wall").onclick = function(){ state.editingZoneId = null; state.drawing = true; state.drawKind = "mur"; state.drawPoints = []; state.drawPointsRedo = []; drawExistingZones(); drawToolbar(); };
       document.getElementById("btn-start-halfwall").onclick = function(){ state.editingZoneId = null; state.drawing = true; state.drawKind = "demimur"; state.drawPoints = []; state.drawPointsRedo = []; drawExistingZones(); drawToolbar(); };
       document.getElementById("btn-start-warzone").onclick = function(){ state.editingZoneId = null; showWarzoneCreationChoice(); };
@@ -2765,38 +2761,6 @@
     };
   }
 
-  // ---------- Formes prédéfinies (bâtiment carré/rectangle/cercle en un tap) ----------
-  // Centrée sur la vue actuelle de l'éditeur, avec une taille de départ raisonnable —
-  // ensuite à ajuster en faisant glisser les poignées, comme n'importe quel bâtiment dessiné
-  // à la main. La correction cos(latitude) évite qu'un cercle paraisse ovale selon l'endroit
-  // du globe où se trouve le terrain.
-  async function addPresetShape(shapeKind){
-    var mapCenter = state.editorMap ? state.editorMap.getCenter() : state.editorCenter;
-    if(!mapCenter) return;
-    var lat = mapCenter.lat, lng = mapCenter.lng;
-    var mPerDegLat = 111320;
-    var mPerDegLng = 111320 * Math.cos(lat * Math.PI/180);
-    function offset(dLat, dLng){ return [lat + dLat/mPerDegLat, lng + dLng/mPerDegLng]; }
-    var points;
-    if(shapeKind === "carre"){
-      points = [offset(-8,-8), offset(-8,8), offset(8,8), offset(8,-8)];
-    } else if(shapeKind === "rectangle"){
-      points = [offset(-6,-12), offset(-6,12), offset(6,12), offset(6,-12)];
-    } else {
-      points = [];
-      var steps = 16, r = 8;
-      for(var i=0; i<steps; i++){
-        var ang = (i/steps) * 2 * Math.PI;
-        points.push(offset(r*Math.sin(ang), r*Math.cos(ang)));
-      }
-    }
-    var buildingCount = state.editorZones.filter(function(z){ return z.kind === "building"; }).length;
-    state.editorZones.push({ id: genId("z"), kind: "building", name: "Bâtiment " + (buildingCount+1), points: points, status: "intact" });
-    drawExistingZones();
-    drawZoneList();
-    await persistEditorZones();
-  }
-
   function finishDrawing(){
     var isWallKind = state.drawKind === "mur" || state.drawKind === "demimur";
     var minPts = isWallKind ? 2 : 3;
@@ -2984,8 +2948,10 @@
   // l'équipe une fois enregistrée (pas seulement sur le téléphone de qui l'a ajoutée).
   function renderZoneInfoPanel(z){
     return '<div class="panel" data-zone-info="'+z.id+'" style="margin-top:-4px;margin-bottom:6px;">' +
+      '<div class="field" style="margin-top:0;"><label>Nom</label>' +
+        '<input type="text" class="zone-info-name" data-id="'+z.id+'" value="'+escapeHtml(z.name||"")+'" placeholder="Ex. Hangar Nord" /></div>' +
       (z.photo ? ('<img src="'+z.photo+'" style="width:140px;max-width:140px;height:auto;border-radius:6px;margin-bottom:6px;display:block;" />') : '') +
-      '<div class="field" style="margin-top:0;"><label>Notes (détails, accès, etc.)</label>' +
+      '<div class="field"><label>Notes (détails, accès, etc.)</label>' +
         '<textarea class="zone-info-notes" data-id="'+z.id+'" rows="3" placeholder="Ex. 2 fenêtres, 1 porte, accès par le nord">'+escapeHtml(z.notes||"")+'</textarea></div>' +
       '<input type="file" accept="image/*" capture="environment" class="zone-info-photo-camera" data-id="'+z.id+'" style="display:none;" />' +
       '<input type="file" accept="image/*" class="zone-info-photo-gallery" data-id="'+z.id+'" style="display:none;" />' +
@@ -3147,8 +3113,11 @@
       btn.onclick = async function(){
         var z = state.editorZones.find(function(z){ return z.id === btn.dataset.id; });
         var textarea = wrap.querySelector('.zone-info-notes[data-id="'+btn.dataset.id+'"]');
+        var nameInput = wrap.querySelector('.zone-info-name[data-id="'+btn.dataset.id+'"]');
         if(z && textarea){ z.notes = textarea.value; }
+        if(z && nameInput){ var trimmed = nameInput.value.trim(); if(trimmed) z.name = trimmed; }
         state.editingInfoZoneId = null;
+        drawExistingZones();
         drawZoneList();
         await persistEditorZones();
       };
