@@ -2413,6 +2413,16 @@
     });
     var layers = [poly];
 
+    // Icônes d'aide à la reconnaissance (bâtiments uniquement) : jusqu'ici visibles
+    // seulement sur la carte en direct des joueurs, jamais dans l'éditeur — impossible pour
+    // l'organisateur de vérifier leur placement avant de valider. Affichées qu'on soit en
+    // train d'éditer cette zone précise ou non.
+    if(z.emojiMarkers && z.emojiMarkers.length){
+      z.emojiMarkers.forEach(function(em){
+        layers.push(L.marker([em.lat, em.lng], { icon: emojiMarkerIcon(em.emoji), interactive:false }).addTo(map));
+      });
+    }
+
     if(isEditingThis){
       renderSegmentLabels(map, z.points, !useLine);
       var handles = [];
@@ -6269,13 +6279,29 @@
     var cfg = await loadEventConfig(code);
     if(!cfg){ forgetLastEvent(); return false; }
     var playerRecord = await rawStorageGet(eventPlayerKey(code, state.playerId));
-    if(!playerRecord || !playerRecord.name || !playerRecord.team){ return false; }
-    state.event = cfg;
-    state.player.name = playerRecord.name;
-    state.player.team = playerRecord.team;
-    state.player.squad = playerRecord.squad || "";
-    state.screen = "map";
-    return true;
+    if(playerRecord && playerRecord.name && playerRecord.team){
+      state.event = cfg;
+      state.player.name = playerRecord.name;
+      state.player.team = playerRecord.team;
+      state.player.squad = playerRecord.squad || "";
+      state.screen = "map";
+      return true;
+    }
+    // Pas encore de fiche joueur : c'est peut-être l'organisateur, encore en train de
+    // préparer sa carte (bâtiments, points...) avant même d'avoir rejoint une équipe —
+    // dans ce cas on le renvoie directement dans l'éditeur plutôt qu'à l'accueil, sinon
+    // un rafraîchissement accidentel pendant la construction perdait le fil du travail.
+    var vis = await loadVisibility(code);
+    if(vis && vis.adminId === state.playerId){
+      state.event = cfg;
+      state.isOrganizer = true;
+      state.editorMode = "live";
+      state.editorZones = await loadZones(code);
+      state.editorCenter = cfg.center;
+      state.screen = "editor";
+      return true;
+    }
+    return false;
   }
 
   // Ouverture via un lien de partage (🔗) : "?map=<id>" — direction directe vers la bibliothèque.
