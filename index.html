@@ -272,8 +272,8 @@
   .cluster-badge{ display:flex; align-items:center; justify-content:center; width:28px; height:28px; border-radius:50%;
     background:var(--amber-red, #a2231f); color:#fff; font-weight:700; font-size:13px; border:2px solid rgba(231,221,201,.85);
     box-shadow:0 2px 6px rgba(0,0,0,.5); }
-  .seg-label{ font-size:10.5px; font-family:'JetBrains Mono', monospace; color:#191a10; background:rgba(231,221,201,.92);
-    padding:1px 5px; border-radius:2px; white-space:nowrap; text-align:center; box-shadow:0 1px 3px rgba(0,0,0,.4); }
+  .seg-label{ font-size:8px; font-family:'JetBrains Mono', monospace; color:#191a10; background:rgba(231,221,201,.85);
+    padding:0px 3px; border-radius:2px; white-space:nowrap; text-align:center; box-shadow:0 1px 2px rgba(0,0,0,.4); line-height:1.4; }
   .row{ display:flex; gap:8px; }
   .row > *{ flex:1; }
 
@@ -692,6 +692,16 @@
       setLayer: function(kind){
         loupeMap.removeLayer(loupeTileLayer);
         loupeTileLayer = createCachedTileLayer(kind).addTo(loupeMap);
+      },
+      // Pendant qu'on fait glisser une poignée (coin ou déplacement complet), la carte
+      // principale elle-même ne bouge pas — donc 'move zoom' ne se déclenche jamais et la
+      // loupe restait figée sur son dernier état. Cette méthode permet de la recentrer
+      // explicitement sur le point en cours de déplacement, en direct, pour un positionnement
+      // précis sans avoir à lâcher puis vérifier après coup.
+      focusOn: function(latlng){
+        loupeMap.setView(latlng, Math.min(19, mainMap.getZoom()+3), { animate:false });
+        redrawZones();
+        updateMePosition();
       },
       destroy: function(){
         clearInterval(meTimer);
@@ -2368,6 +2378,9 @@
         state.editingZoneId = isEditingThis ? null : z.id;
         drawExistingZones();
       });
+      marker.on('drag', function(e){
+        if(state.loupeEditor) state.loupeEditor.focusOn(e.target.getLatLng());
+      });
       marker.on('dragend', async function(e){
         var ll = e.target.getLatLng();
         z.latlng = [ll.lat, ll.lng];
@@ -2386,6 +2399,9 @@
         drawExistingZones();
       });
       var centerMarker = L.marker([z.center.lat, z.center.lng], { icon: vertexHandleIcon(), draggable: isEditingThis }).addTo(map);
+      centerMarker.on('drag', function(e){
+        if(state.loupeEditor) state.loupeEditor.focusOn(e.target.getLatLng());
+      });
       centerMarker.on('dragend', async function(e){
         var ll = e.target.getLatLng();
         z.center = { lat: ll.lat, lng: ll.lng };
@@ -2433,6 +2449,7 @@
           z.points[idx] = [ll.lat, ll.lng];
           poly.setLatLngs(z.points);
           renderSegmentLabels(map, z.points, !useLine);
+          if(state.loupeEditor) state.loupeEditor.focusOn(ll);
         });
         handle.on('dragend', async function(){ await persistEditorZones(); });
         handles.push(handle);
@@ -2455,6 +2472,7 @@
         poly.setLatLngs(z.points);
         handles.forEach(function(h, idx){ h.setLatLng(z.points[idx]); });
         renderSegmentLabels(map, z.points, !useLine);
+        if(state.loupeEditor) state.loupeEditor.focusOn(ll);
       });
       moveHandle.on('dragend', async function(){ await persistEditorZones(); });
       layers.push(moveHandle);
@@ -2506,7 +2524,7 @@
       var mid = [ (a[0]+b[0])/2, (a[1]+b[1])/2 ];
       var d = distanceMeters(a[0], a[1], b[0], b[1]);
       var label = d < 10 ? (d.toFixed(1)+" m") : (Math.round(d)+" m");
-      var icon = L.divIcon({ html:'<div class="seg-label">'+label+'</div>', className:'', iconSize:[54,18], iconAnchor:[27,9] });
+      var icon = L.divIcon({ html:'<div class="seg-label">'+label+'</div>', className:'', iconSize:[34,12], iconAnchor:[17,6] });
       var marker = L.marker(mid, { icon: icon, interactive:false }).addTo(map);
       state.segmentLabelLayers.push(marker);
     }
