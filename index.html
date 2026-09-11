@@ -874,11 +874,26 @@
     pings = pings.filter(function(p){ return (now - p.ts) < PING_DURATION_MS; });
     pings.push({
       id: genId("ping"), kind: kindDef.kind, emoji: kindDef.emoji, label: kindDef.label,
-      lat: lat, lng: lng, team: state.player.team || null, playerName: state.player.name || "?", ts: now
+      lat: lat, lng: lng, team: state.player.team || null, playerName: state.player.name || "?",
+      playerId: state.playerId, ts: now
     });
     var ok = await storageSet(eventPingsKey(code), JSON.stringify(pings));
     appendEventLog(code, { ts: now, type: "ping", name: state.player.name || "?", team: state.player.team || null, detail: kindDef.emoji + " " + kindDef.label });
     return ok;
+  }
+  async function removePing(code, pingId){
+    var pings = await loadPings(code);
+    pings = pings.filter(function(p){ return p.id !== pingId; });
+    return storageSet(eventPingsKey(code), JSON.stringify(pings));
+  }
+  async function ackPing(code, pingId, playerName){
+    var pings = await loadPings(code);
+    var ping = pings.find(function(p){ return p.id === pingId; });
+    if(!ping) return false;
+    if(!ping.acks) ping.acks = [];
+    if(ping.acks.some(function(a){ return a.playerId === state.playerId; })) return true;
+    ping.acks.push({ name: playerName, playerId: state.playerId, ts: Date.now() });
+    return storageSet(eventPingsKey(code), JSON.stringify(pings));
   }
 
   async function loadEventConfig(code){
@@ -1394,6 +1409,7 @@
       '</div>' +
       '<div class="stack">' +
         '<button class="btn btn-ghost" id="btn-notice" style="border-color:var(--amber);color:var(--amber);">📖 C\u2019est quoi cette appli ? (lis ça d\u2019abord)</button>' +
+        (isAppInstalled() ? '' : '<button class="btn btn-ghost" id="btn-install-app" style="display:'+(deferredInstallPrompt?'':'none')+';margin-top:6px;">📲 Installer l\u2019application (raccourci)</button>') +
         '<div class="eyebrow" style="margin-top:10px;">Avant de commencer</div>' +
         '<button class="btn btn-ghost" id="btn-perms">Activer localisation &amp; caméra</button>' +
         '<div id="perm-status"></div>' +
@@ -1413,6 +1429,14 @@
 
     document.getElementById("btn-perms").onclick = function(){ requestAllPermissions("perm-status"); };
     document.getElementById("btn-notice").onclick = function(){ state.screen="notice"; render(); };
+    var installBtn = document.getElementById("btn-install-app");
+    if(installBtn) installBtn.onclick = async function(){
+      if(!deferredInstallPrompt) return;
+      deferredInstallPrompt.prompt();
+      try{ await deferredInstallPrompt.userChoice; }catch(e){}
+      deferredInstallPrompt = null;
+      installBtn.style.display = "none";
+    };
     document.getElementById("btn-create").onclick = function(){ state.screen="create"; render(); };
     document.getElementById("btn-join").onclick = function(){ state.screen="join"; render(); };
     document.getElementById("btn-library").onclick = function(){ state.screen="library"; render(); };
@@ -1490,6 +1514,30 @@
         requireInteraction: true
       });
     }catch(e){}
+  }
+
+  // ---------- Bouton "Installer l'application" sur l'accueil ----------
+  // Le navigateur ne propose son invite native qu'une fois — on la capture ici pour pouvoir
+  // la redéclencher nous-mêmes depuis un bouton bien visible, plutôt que de dépendre du
+  // moment (parfois discret ou différé) où le navigateur l'affiche tout seul.
+  var deferredInstallPrompt = null;
+  function setupInstallPrompt(){
+    window.addEventListener('beforeinstallprompt', function(e){
+      e.preventDefault();
+      deferredInstallPrompt = e;
+      var btn = document.getElementById('btn-install-app');
+      if(btn) btn.style.display = '';
+    });
+    window.addEventListener('appinstalled', function(){
+      deferredInstallPrompt = null;
+      var btn = document.getElementById('btn-install-app');
+      if(btn) btn.style.display = 'none';
+    });
+  }
+  function isAppInstalled(){
+    try{
+      return window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
+    }catch(e){ return false; }
   }
 
   function renderCreate(){
@@ -2039,7 +2087,7 @@
     if(!navigator.geolocation) return;
     if(state.editorWatchId !== null) return;
     state.editorWatchId = navigator.geolocation.watchPosition(function(pos){
-      state.lastCoords = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+      state.lastCoords = filterGpsReading(pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy);
       var el = document.getElementById("editor-geo-status");
       if(el) el.textContent = "Position GPS active — précision ~" + Math.round(pos.coords.accuracy) + " m";
       if(state.editorMap){
@@ -2152,6 +2200,7 @@
         state.refImageBounds[c.setLat] = ll.lat;
         state.refImageBounds[c.setLng] = ll.lng;
         updateRefImageOverlayPosition();
+        if(state.loupeEditor) state.loupeEditor.focusOn(ll);
       });
       state.refImageHandles.push(handle);
     });
@@ -2902,9 +2951,10 @@
   function renderZoneRow(z){
     if(z.kind === "point"){
       var ic = POINT_ICONS.find(function(i){ return i.key === z.icon; }) || POINT_ICONS[0];
+      var ptDistTxt = z.latlng ? distanceLabel(z.latlng[0], z.latlng[1]) : null;
       return '<div class="zone-row">' +
         '<span style="font-size:15px;">'+ic.emoji+'</span>' +
-        '<span class="name">'+escapeHtml(z.name)+'</span>' +
+        '<span class="name">'+escapeHtml(z.name)+(ptDistTxt ? ' <span class="mono" style="font-size:10px;color:var(--ink-dim);">· '+ptDistTxt+'</span>' : '')+'</span>' +
         '<button class="btn btn-sm btn-ghost zone-info-toggle" data-id="'+z.id+'" title="Détails">ℹ️</button>' +
         '<button class="btn btn-sm btn-ghost point-edit" data-id="'+z.id+'" style="padding:6px 10px;">Modifier</button>' +
         '<button class="remove-chip zone-del" data-id="'+z.id+'">✕</button>' +
@@ -2959,9 +3009,10 @@
       '</div>';
     }
     var info = zoneStatusInfo(z.status);
+    var distTxt = (z.points && z.points.length) ? distanceLabel(polygonCentroid(z.points)[0], polygonCentroid(z.points)[1]) : null;
     return '<div class="zone-row">' +
       '<span class="dot" style="background:'+info.color+'"></span>' +
-      '<span class="name">'+escapeHtml(z.name)+'</span>' +
+      '<span class="name">'+escapeHtml(z.name)+(distTxt ? ' <span class="mono" style="font-size:10px;color:var(--ink-dim);">· '+distTxt+'</span>' : '')+'</span>' +
       '<select class="zone-status" data-id="'+z.id+'">' +
         ZONE_STATUSES.map(function(s){ return '<option value="'+s.key+'"'+(s.key===z.status?' selected':'')+'>'+s.label+'</option>'; }).join("") +
       '</select>' +
@@ -4156,6 +4207,10 @@
       return;
     }
 
+    var positionedEvents = visibleLog.filter(function(e){
+      return (e.type === "sos" || e.type === "deathmatch_out" || e.type === "flag_capture") && e.lat != null && e.lng != null;
+    });
+
     el.innerHTML =
       '<div class="panel"><label class="mono" style="font-size:10px;color:var(--ink-dim);text-transform:uppercase;">Score final</label>' +
         (allTeams.length ? allTeams.map(function(t){
@@ -4176,7 +4231,33 @@
       '<div class="panel" style="margin-top:10px;"><label class="mono" style="font-size:10px;color:var(--ink-dim);text-transform:uppercase;">Autres</label>' +
         '<p style="font-size:12px;">📂 Objectifs atteints : <b>'+objectivesDone+'</b></p>' +
         '<p style="font-size:12px;">🆘 SOS déclenchés : <b>'+sosCount+'</b></p>' +
-      '</div>';
+      '</div>' +
+      (positionedEvents.length ? (
+        '<div class="panel" style="margin-top:10px;"><label class="mono" style="font-size:10px;color:var(--ink-dim);text-transform:uppercase;">🗺️ Carte des événements</label>' +
+          '<p style="font-size:11px;color:var(--ink-dim);margin:4px 0 8px;">🆘 SOS · ☠️ Élimination · 🚩 Capture — repère uniquement les événements survenus depuis cette mise à jour, pas tout l\u2019historique du déplacement.</p>' +
+          '<div id="recap-map" style="height:220px;border-radius:8px;overflow:hidden;"></div>' +
+        '</div>'
+      ) : '');
+
+    if(positionedEvents.length && LIBS_OK.leaflet){
+      setTimeout(async function(){
+        var mapEl = document.getElementById("recap-map");
+        if(!mapEl) return;
+        var rmap = L.map("recap-map", { zoomControl:false, attributionControl:false });
+        createCachedTileLayer(state.mapLayerKind).addTo(rmap);
+        var zones = await loadZones(code);
+        zones.forEach(function(z){ if(isValidZone(z)){ try{ addZoneLayer(rmap, z); }catch(e){} } });
+        var evIcon = { sos:"🆘", deathmatch_out:"☠️", flag_capture:"🚩" };
+        var pts = [];
+        positionedEvents.forEach(function(e){
+          var icon = L.divIcon({ html:'<div style="font-size:18px;filter:drop-shadow(0 1px 2px rgba(0,0,0,.8));">'+evIcon[e.type]+'</div>', className:"", iconSize:[22,22], iconAnchor:[11,11] });
+          L.marker([e.lat, e.lng], { icon: icon }).addTo(rmap).bindTooltip(escapeHtml(e.name||"")+(e.team ? (' · '+escapeHtml(e.team)) : ''));
+          pts.push([e.lat, e.lng]);
+        });
+        if(pts.length === 1) rmap.setView(pts[0], 17);
+        else rmap.fitBounds(pts, { padding:[24,24] });
+      }, 0);
+    }
   }
 
   function renderLog(){
@@ -4824,7 +4905,12 @@
       btn.textContent = state.player.sos ? "🆘 Annuler la demande d\u2019aide" : "🆘 Demander de l\u2019aide";
       if(state.event && state.player.name){
         await upsertPlayer(state.event.code, state.playerId, { sos: state.player.sos });
-        await appendEventLog(state.event.code, { ts: Date.now(), type: state.player.sos ? "sos" : "sos_resolved", name: state.player.name, team: state.player.team });
+        await appendEventLog(state.event.code, { ts: Date.now(), type: state.player.sos ? "sos" : "sos_resolved", name: state.player.name, team: state.player.team, lat: state.lastCoords ? state.lastCoords.lat : null, lng: state.lastCoords ? state.lastCoords.lng : null });
+        // Un repère visuel directement sur la carte, en plus de l'alerte son/vibration —
+        // pas besoin de chercher dans le roster qui est en SOS pour savoir où courir.
+        if(state.player.sos && state.lastCoords){
+          await addPing(state.event.code, { kind:"sos", emoji:"🆘", label:"Position SOS" }, state.lastCoords.lat, state.lastCoords.lng);
+        }
       }
     };
 
@@ -5139,7 +5225,7 @@
     }
     setStatus(false, "Recherche de la position…");
     state.watchId = navigator.geolocation.watchPosition(function(pos){
-      state.lastCoords = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+      state.lastCoords = filterGpsReading(pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy);
       setStatus(true, "Position active");
       if(state.followMe && state.map){ state.map.panTo([state.lastCoords.lat, state.lastCoords.lng], { animate:true }); }
     }, function(err){
@@ -5160,6 +5246,40 @@
     if(!dot) return;
     dot.className = "status-dot" + (ok ? "" : " off");
     t.textContent = text;
+  }
+
+  // ---------- Lissage et filtrage du signal GPS ----------
+  // Le GPS brut d'un téléphone peut "sauter" de plusieurs mètres d'un coup (rebonds sur les
+  // bâtiments, sous les arbres, etc.). Deux techniques combinées, peu coûteuses en calcul :
+  // 1) rejet des sursauts implausibles — une vitesse déduite au-delà de ce qu'un humain peut
+  //    courir n'est acceptée que si la nouvelle lecture est elle-même très précise (dans ce
+  //    cas, un vrai déplacement rapide — véhicule, sprint — reste possible et n'est jamais
+  //    bloqué) ;
+  // 2) lissage exponentiel pondéré par la précision annoncée par le téléphone — une lecture
+  //    peu précise pèse moins dans la position affichée qu'une lecture précise, sans jamais
+  //    complètement l'ignorer.
+  function filterGpsReading(rawLat, rawLng, accuracy){
+    var now = Date.now();
+    var prev = state.gpsFilterState;
+    if(!prev){
+      state.gpsFilterState = { lat: rawLat, lng: rawLng, ts: now };
+      return { lat: rawLat, lng: rawLng };
+    }
+    var dt = (now - prev.ts) / 1000;
+    if(dt > 0 && dt < 8){
+      var moved = distanceMeters(prev.lat, prev.lng, rawLat, rawLng);
+      var speed = moved / dt;
+      var MAX_PLAUSIBLE_SPEED = 12; // ~43 km/h — largement au-dessus d'un sprint
+      if(speed > MAX_PLAUSIBLE_SPEED && accuracy > 15){
+        state.gpsFilterState.ts = now;
+        return { lat: prev.lat, lng: prev.lng };
+      }
+    }
+    var precisionWeight = Math.max(0.2, Math.min(0.9, 15 / Math.max(accuracy || 15, 3)));
+    var smoothLat = prev.lat + (rawLat - prev.lat) * precisionWeight;
+    var smoothLng = prev.lng + (rawLng - prev.lng) * precisionWeight;
+    state.gpsFilterState = { lat: smoothLat, lng: smoothLng, ts: now };
+    return { lat: smoothLat, lng: smoothLng };
   }
 
   async function writePositionNow(){
@@ -5197,7 +5317,7 @@
           payload.livesRemaining = state.player.livesRemaining - 1;
           state.player.livesRemaining = payload.livesRemaining;
           if(payload.livesRemaining <= 0){
-            appendEventLog(state.event.code, { ts: Date.now(), type: "deathmatch_out", name: state.player.name, team: state.player.team });
+            appendEventLog(state.event.code, { ts: Date.now(), type: "deathmatch_out", name: state.player.name, team: state.player.team, lat: state.lastCoords ? state.lastCoords.lat : null, lng: state.lastCoords ? state.lastCoords.lng : null });
           }
         }
         state.player._wasInSpawn = inSpawn;
@@ -5605,7 +5725,7 @@
           z.captureOwner = team;
           z.captureProgress = 0;
           z.captureTarget = null;
-          captureEvents.push({ team: team, flagName: z.name });
+          captureEvents.push({ team: team, flagName: z.name, points: z.points });
         }
         dirty = true;
       } else {
@@ -5694,7 +5814,8 @@
             state.cachedScore = score;
           }
           tick.captureEvents.forEach(function(ev){
-            appendEventLog(state.event.code, { ts: Date.now(), type: "flag_capture", name: ev.flagName, team: ev.team });
+            var c = (ev.points && ev.points.length) ? polygonCentroid(ev.points) : null;
+            appendEventLog(state.event.code, { ts: Date.now(), type: "flag_capture", name: ev.flagName, team: ev.team, lat: c ? c[0] : null, lng: c ? c[1] : null });
           });
         }
       }
@@ -5793,9 +5914,39 @@
       if(state.pingMarkers[p.id]) return; // déjà affiché
       var icon = L.divIcon({ html:'<div class="ping-marker">'+p.emoji+'</div>', className:'', iconSize:[26,26], iconAnchor:[13,13] });
       var marker = L.marker([p.lat, p.lng], { icon: icon }).addTo(state.map);
+      var isMine = p.playerId === state.playerId;
       marker.on('click', function(){
-        var secsLeft = Math.max(0, Math.round((PING_DURATION_MS - (Date.now()-p.ts))/1000));
-        marker.bindPopup(escapeHtml(p.label) + ' — ' + escapeHtml(p.playerName) + '<br/><span style="font-size:11px;">disparaît dans ' + secsLeft + 's</span>').openPopup();
+        var current = (state.cachedPings || []).find(function(pp){ return pp.id === p.id; }) || p;
+        var secsLeft = Math.max(0, Math.round((PING_DURATION_MS - (Date.now()-current.ts))/1000));
+        var acks = current.acks || [];
+        var alreadyAcked = acks.some(function(a){ return a.playerId === state.playerId; });
+        var html = escapeHtml(current.label) + ' — ' + escapeHtml(current.playerName) +
+          '<br/><span style="font-size:11px;">disparaît dans ' + secsLeft + 's</span>';
+        if(acks.length){
+          html += '<br/><span style="font-size:11px;color:#3c6e3a;">🏃 '+acks.map(function(a){ return escapeHtml(a.name); }).join(", ")+'</span>';
+        }
+        html += '<div style="margin-top:6px;">' +
+          (isMine
+            ? '<button class="btn btn-sm btn-ghost" id="ping-pop-del" style="font-size:11px;padding:4px 8px;">Supprimer</button>'
+            : (alreadyAcked ? '' : '<button class="btn btn-sm btn-ghost" id="ping-pop-ack" style="font-size:11px;padding:4px 8px;">🏃 J\u2019arrive</button>')
+          ) +
+        '</div>';
+        marker.bindPopup(html).openPopup();
+        setTimeout(function(){
+          var delBtn = document.getElementById("ping-pop-del");
+          if(delBtn) delBtn.onclick = async function(){
+            marker.closePopup();
+            state.map.removeLayer(marker);
+            delete state.pingMarkers[p.id];
+            await removePing(state.event.code, p.id);
+          };
+          var ackBtn = document.getElementById("ping-pop-ack");
+          if(ackBtn) ackBtn.onclick = async function(){
+            ackBtn.disabled = true;
+            ackBtn.textContent = "C'est noté";
+            await ackPing(state.event.code, p.id, state.player.name || "?");
+          };
+        }, 0);
       });
       state.pingMarkers[p.id] = marker;
     });
@@ -6224,6 +6375,7 @@
     state.ghostMarkerLayers = null;
     state.prevVisibleIds = null;
     state.prevVisiblePositions = null;
+    state.gpsFilterState = null;
   }
 
   // ---------- Écran maintenu actif pendant la partie ----------
@@ -6334,6 +6486,14 @@
       attemptAutoRejoin().then(function(){ render(); });
     }
   }catch(e){ render(); }
+
+  // Le service worker doit être enregistré dès l'arrivée sur le site, sans attendre qu'une
+  // permission soit accordée — c'est l'une des conditions dont le navigateur a besoin pour
+  // proposer "Installer l'application" (icône dans la barre d'adresse, ou bannière). Il ne
+  // fait rien tout seul (aucune notification n'est envoyée sans autorisation explicite) ; il
+  // sert aussi, une fois les alertes SOS autorisées, à afficher ces notifications.
+  registerSosServiceWorker();
+  setupInstallPrompt();
 })();
 </script>
 </body>
