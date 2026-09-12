@@ -848,11 +848,10 @@
     { key:"bloodType", label:"Groupe sanguin" },
     { key:"taille", label:"Taille" },
     { key:"poids", label:"Poids" },
-    { key:"corpulence", label:"Corpulence" },
     { key:"yeux", label:"Couleur des yeux" },
     { key:"cheveux", label:"Couleur des cheveux" },
     { key:"signes", label:"Signes particuliers" },
-    { key:"occupation", label:"Occupation" },
+    { key:"replique", label:"Réplique de prédilection" },
     { key:"faction", label:"Faction / Affiliation" },
     { key:"role", label:"Rôle" },
     { key:"statut", label:"Statut" },
@@ -4283,7 +4282,7 @@
           '<div style="flex:1;">' +
             '<div style="display:inline-block;padding:3px 10px;border:2px solid '+col+';color:'+col+';font-weight:800;letter-spacing:2px;font-size:12px;transform:rotate(-4deg);">CONFIDENTIEL</div>' +
             '<p class="mono" style="margin-top:8px;font-size:11px;color:#5a5136;">PSEUDO</p>' +
-            '<p style="font-size:16px;font-weight:700;margin:0 0 8px;">'+escapeHtml(state.player.name||"?")+'</p>' +
+            '<p style="font-size:16px;font-weight:700;margin:0 0 8px;">'+escapeHtml(state.player.name||"(non défini)")+'</p>' +
           '</div>' +
           (photo ? '<img src="'+photo+'" style="width:76px;height:76px;object-fit:cover;border:3px solid #fff;box-shadow:0 2px 6px rgba(0,0,0,.4);transform:rotate(3deg);" />' : '') +
         '</div>' +
@@ -6604,6 +6603,7 @@
     if(vis && vis.adminId === state.playerId){
       state.event = cfg;
       state.isOrganizer = true;
+      state.player.name = state.player.name || "Organisateur";
       state.editorMode = "live";
       state.editorZones = await loadZones(code);
       state.editorCenter = cfg.center;
