@@ -436,6 +436,7 @@
     notifUnreadChat: 0,
     notifRecent: [],
     cachedPlayerPhotos: {},
+    idCardFields: {}, idCardRedacted: {}, idCardMode: "view",
     rosterSearch: "",
     isOrganizer: false,
     lastCoords: null,   // {lat,lng}
@@ -835,6 +836,39 @@
     if(dataUrl){ photos[playerId] = dataUrl; } else { delete photos[playerId]; }
     return storageSet(eventPlayerPhotosKey(code), JSON.stringify(photos));
   }
+  // ---------- Carte d'identité (roleplay, 100% facultative) ----------
+  // Même principe que la photo : stockée à part de la fiche joueur pour ne jamais être
+  // renvoyée en boucle. Chaque champ peut être individuellement caviardé par son propriétaire
+  // (barre noire), sans jamais rien de calculé/automatique — uniquement ce que le joueur tape.
+  var ID_CARD_FIELDS = [
+    { key:"nom", label:"Nom" },
+    { key:"prenom", label:"Prénom" },
+    { key:"dob", label:"Date de naissance" },
+    { key:"pob", label:"Lieu de naissance" },
+    { key:"bloodType", label:"Groupe sanguin" },
+    { key:"taille", label:"Taille" },
+    { key:"poids", label:"Poids" },
+    { key:"corpulence", label:"Corpulence" },
+    { key:"yeux", label:"Couleur des yeux" },
+    { key:"cheveux", label:"Couleur des cheveux" },
+    { key:"signes", label:"Signes particuliers" },
+    { key:"occupation", label:"Occupation" },
+    { key:"faction", label:"Faction / Affiliation" },
+    { key:"role", label:"Rôle" },
+    { key:"statut", label:"Statut" },
+    { key:"description", label:"Description" }
+  ];
+  function eventIdCardsKey(code){ return "event:" + code + ":idCards"; }
+  async function loadIdCards(code){
+    var raw = await storageGet(eventIdCardsKey(code));
+    if(!raw) return {};
+    try{ return JSON.parse(raw); }catch(e){ return {}; }
+  }
+  async function saveIdCard(code, playerId, fields, redacted){
+    var cards = await loadIdCards(code);
+    cards[playerId] = { fields: fields, redacted: redacted };
+    return storageSet(eventIdCardsKey(code), JSON.stringify(cards));
+  }
   function eventTimersKey(code){ return "event:" + code + ":timers"; }
   async function loadTimers(code){
     var raw = await storageGet(eventTimersKey(code));
@@ -1133,6 +1167,7 @@
     if(state.screen === "log") return renderLog();
     if(state.screen === "chat") return renderChat();
     if(state.screen === "recap") return renderRecap();
+    if(state.screen === "idcard") return renderIdCard();
     if(state.screen === "eventhistory") return renderEventHistory();
     if(state.screen === "notice") return renderNotice();
     if(state.screen === "gamemode") return renderGameMode();
@@ -4168,6 +4203,104 @@
   }
 
   // ---------- Récap (score final, captures, éliminations, objectifs) ----------
+  // ---------- Carte d'identité (roleplay) ----------
+  function renderIdCard(){
+    app.innerHTML =
+      '<div class="topbar"><button class="back">‹ Retour</button><div class="eyebrow">🪪 Ma carte</div></div>' +
+      '<div id="idcard-content"><p class="mono" style="font-size:11px;color:var(--ink-dim);">Chargement…</p></div>';
+    document.querySelector(".back").onclick = function(){ state.screen="map"; render(); };
+    loadIdCardScreen();
+  }
+
+  async function loadIdCardScreen(){
+    var el = document.getElementById("idcard-content");
+    if(!el || !state.event) return;
+    var code = state.event.code;
+    var cards = await loadIdCards(code);
+    var mine = cards[state.playerId] || { fields:{}, redacted:{} };
+    state.idCardFields = mine.fields || {};
+    state.idCardRedacted = mine.redacted || {};
+    state.idCardMode = "view";
+    drawIdCard();
+  }
+
+  function redactedBar(text){
+    var n = Math.max(4, Math.min(14, (text||"").length || 8));
+    return "⬛".repeat(n);
+  }
+
+  function drawIdCard(){
+    var el = document.getElementById("idcard-content");
+    if(!el) return;
+    var photo = (state.cachedPlayerPhotos||{})[state.playerId];
+    var col = teamColor(state.event || {}, state.player.team);
+
+    if(state.idCardMode === "edit"){
+      el.innerHTML =
+        '<div class="panel">' +
+          '<p style="font-size:12px;color:var(--ink-dim);">Tout est facultatif. Coche 🔒 pour caviarder un champ précis — il restera visible pour toi en édition, mais s\u2019affichera en barre noire sur la carte.</p>' +
+          ID_CARD_FIELDS.map(function(f){
+            var isLong = f.key === "description";
+            return '<div class="field"><label>'+f.label+'</label>' +
+              '<div class="row" style="align-items:flex-start;">' +
+                (isLong
+                  ? '<textarea class="idcard-input" data-key="'+f.key+'" rows="3" style="flex:1;">'+escapeHtml(state.idCardFields[f.key]||"")+'</textarea>'
+                  : '<input type="text" class="idcard-input" data-key="'+f.key+'" value="'+escapeHtml(state.idCardFields[f.key]||"")+'" style="flex:1;" />'
+                ) +
+                '<label style="flex:none;display:flex;align-items:center;gap:4px;font-size:11px;color:var(--ink-dim);padding:8px 4px;">' +
+                  '<input type="checkbox" class="idcard-redact" data-key="'+f.key+'" '+(state.idCardRedacted[f.key]?'checked':'')+' /> 🔒' +
+                '</label>' +
+              '</div>' +
+            '</div>';
+          }).join("") +
+          '<div class="row" style="margin-top:10px;">' +
+            '<button class="btn btn-sm btn-primary" id="btn-idcard-save">Enregistrer</button>' +
+            '<button class="btn btn-sm btn-ghost" id="btn-idcard-cancel">Annuler</button>' +
+          '</div>' +
+        '</div>';
+      Array.prototype.forEach.call(el.querySelectorAll(".idcard-input"), function(inp){
+        inp.oninput = function(){ state.idCardFields[inp.dataset.key] = inp.value; };
+      });
+      Array.prototype.forEach.call(el.querySelectorAll(".idcard-redact"), function(cb){
+        cb.onchange = function(){ state.idCardRedacted[cb.dataset.key] = cb.checked; };
+      });
+      document.getElementById("btn-idcard-save").onclick = async function(){
+        await saveIdCard(state.event.code, state.playerId, state.idCardFields, state.idCardRedacted);
+        state.idCardMode = "view";
+        drawIdCard();
+      };
+      document.getElementById("btn-idcard-cancel").onclick = function(){
+        state.idCardMode = "view";
+        loadIdCardScreen();
+      };
+      return;
+    }
+
+    // Mode vue — présentation façon dossier officiel vieilli.
+    el.innerHTML =
+      '<div class="panel" style="background:linear-gradient(#e9dfc4,#ded2ae);color:#2a2416;border:1px solid #a8976b;">' +
+        '<div class="row" style="align-items:flex-start;">' +
+          '<div style="flex:1;">' +
+            '<div style="display:inline-block;padding:3px 10px;border:2px solid '+col+';color:'+col+';font-weight:800;letter-spacing:2px;font-size:12px;transform:rotate(-4deg);">CONFIDENTIEL</div>' +
+            '<p class="mono" style="margin-top:8px;font-size:11px;color:#5a5136;">PSEUDO</p>' +
+            '<p style="font-size:16px;font-weight:700;margin:0 0 8px;">'+escapeHtml(state.player.name||"?")+'</p>' +
+          '</div>' +
+          (photo ? '<img src="'+photo+'" style="width:76px;height:76px;object-fit:cover;border:3px solid #fff;box-shadow:0 2px 6px rgba(0,0,0,.4);transform:rotate(3deg);" />' : '') +
+        '</div>' +
+        ID_CARD_FIELDS.map(function(f){
+          var val = state.idCardFields[f.key];
+          var shown = state.idCardRedacted[f.key] ? redactedBar(val) : (val ? escapeHtml(val) : "—");
+          return '<p class="mono" style="font-size:11px;color:#5a5136;margin:8px 0 0;">'+f.label.toUpperCase()+'</p>' +
+                 '<p style="margin:0;font-size:14px;">'+shown+'</p>';
+        }).join("") +
+      '</div>' +
+      '<button class="btn btn-sm btn-primary" id="btn-idcard-edit" style="margin-top:10px;">✏️ Modifier ma carte</button>';
+    document.getElementById("btn-idcard-edit").onclick = function(){
+      state.idCardMode = "edit";
+      drawIdCard();
+    };
+  }
+
   function renderRecap(){
     app.innerHTML =
       '<div class="topbar"><button class="back">‹ Retour</button><div class="eyebrow">📊 Récap</div></div>' +
@@ -4817,6 +4950,7 @@
         '<button class="btn btn-sm btn-ghost" id="btn-log-player">📋 Journal</button>' +
         '<button class="btn btn-sm btn-ghost" id="btn-chat-player">💬 Chat</button>' +
         '<button class="btn btn-sm btn-ghost" id="btn-recap-player">📊 Récap</button>' +
+        '<button class="btn btn-sm btn-ghost" id="btn-idcard-player">🪪 Ma carte</button>' +
       '</div>' +
       '<div id="ping-menu"></div>' +
       '<div id="trail-menu"></div>' +
@@ -4958,6 +5092,11 @@
     document.getElementById("btn-recap-player").onclick = function(){
       teardownMap();
       state.screen = "recap";
+      render();
+    };
+    document.getElementById("btn-idcard-player").onclick = function(){
+      teardownMap();
+      state.screen = "idcard";
       render();
     };
 
