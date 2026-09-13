@@ -4238,6 +4238,10 @@
       el.innerHTML =
         '<div class="panel">' +
           '<p style="font-size:12px;color:var(--ink-dim);">Tout est facultatif. Coche 🔒 pour caviarder un champ précis — il restera visible pour toi en édition, mais s\u2019affichera en barre noire sur la carte.</p>' +
+          '<div class="field"><label>Pseudo</label>' +
+            '<input type="text" id="idcard-pseudo" value="'+escapeHtml(state.player.name||"")+'" />' +
+            '<p style="font-size:11px;color:var(--ink-dim);margin-top:2px;">Ton pseudo de jeu — visible partout (carte, roster, chat), jamais caviardable.</p>' +
+          '</div>' +
           ID_CARD_FIELDS.map(function(f){
             var isLong = f.key === "description";
             return '<div class="field"><label>'+f.label+'</label>' +
@@ -4264,6 +4268,12 @@
         cb.onchange = function(){ state.idCardRedacted[cb.dataset.key] = cb.checked; };
       });
       document.getElementById("btn-idcard-save").onclick = async function(){
+        var pseudoInput = document.getElementById("idcard-pseudo");
+        var newPseudo = pseudoInput ? pseudoInput.value.trim() : "";
+        if(newPseudo && newPseudo !== state.player.name){
+          state.player.name = newPseudo;
+          await upsertPlayer(state.event.code, state.playerId, { name: newPseudo });
+        }
         await saveIdCard(state.event.code, state.playerId, state.idCardFields, state.idCardRedacted);
         state.idCardMode = "view";
         drawIdCard();
